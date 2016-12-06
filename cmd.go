@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"io"
 	"os/exec"
 )
 
@@ -11,6 +12,9 @@ import (
 //
 type Cmd struct {
 	*exec.Cmd
+
+	Name       string
+	stdoutPipe io.ReadCloser
 }
 
 // Command returns the Cmd struct to execute the named program with the given arguments.
