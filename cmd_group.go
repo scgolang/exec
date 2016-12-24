@@ -29,6 +29,7 @@ func (cg *Group) Add(name, command string, args ...string) error {
 	return cg.AddCmd(name, CommandContext(cg.ctx, command, args...))
 }
 
+// AddCmd adds the provided command to the group.
 func (cg *Group) AddCmd(name string, cmd *Cmd) error {
 	cg.cmdsMutex.Lock()
 	if _, ok := cg.cmds[name]; ok {
