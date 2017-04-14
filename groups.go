@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"syscall"
 
 	"github.com/pkg/errors"
 )
@@ -50,7 +51,15 @@ func NewGroups(root string) (*Groups, error) {
 
 // Close closes the current Group.
 func (g *Groups) Close() error {
-	return nil
+	if g.cur == nil {
+		return nil
+	}
+	return g.cur.Signal(syscall.SIGKILL)
+}
+
+// Current returns the current Group.
+func (g *Groups) Current() *Group {
+	return g.cur
 }
 
 func (g *Groups) initialize() error {
