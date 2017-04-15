@@ -1,1 +1,8 @@
+# coverage files
 cover*
+
+# sqlite databases
+*.db
+
+# local data directory
+.data/
