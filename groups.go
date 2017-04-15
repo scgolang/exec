@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/pkg/errors"
@@ -17,6 +19,7 @@ const (
 	stdoutFile  = ".stdout"
 	stderrFile  = ".stderr"
 	dotCurrent  = ".current"
+	dirPerms    = 0755
 )
 
 // Groups manages a collection of Group's by persisting group information to disk.
@@ -29,19 +32,24 @@ const (
 //
 type Groups struct {
 	// cur is the currently open process group.
-	cur *Group
+	cur string
 
 	// fd is the *os.File for the root directory.
 	fd *os.File
+
+	// groups maps base names of group directories to groups.
+	groups   map[string]*Group
+	groupsMu sync.RWMutex
 
 	// root is root directory of the Groups.
 	root string
 }
 
-// NewGroups creates
+// NewGroups creates a new collection of persistent process groups.
 func NewGroups(root string) (*Groups, error) {
 	g := &Groups{
-		root: root,
+		groups: map[string]*Group{},
+		root:   root,
 	}
 	if err := g.initialize(); err != nil {
 		return nil, errors.Wrap(err, "initializing groups")
@@ -51,15 +59,28 @@ func NewGroups(root string) (*Groups, error) {
 
 // Close closes the current Group.
 func (g *Groups) Close() error {
-	if g.cur == nil {
+	errs := []string{}
+
+	if cur := g.Current(); cur != nil {
+		if err := cur.Signal(syscall.SIGKILL); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if err := g.fd.Close(); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) == 0 {
 		return nil
 	}
-	return g.cur.Signal(syscall.SIGKILL)
+	return errors.New(strings.Join(errs, ", and "))
 }
 
 // Current returns the current Group.
 func (g *Groups) Current() *Group {
-	return g.cur
+	g.groupsMu.RLock()
+	cur := g.groups[g.cur]
+	g.groupsMu.RUnlock()
+	return cur
 }
 
 func (g *Groups) initialize() error {
@@ -75,8 +96,40 @@ func (g *Groups) initialize() error {
 	return nil
 }
 
+// initializeGroup initializes a new group and makes it the current group.
+func (g *Groups) initializeGroup(name string) error {
+	g.groups[name] = NewGroup()
+
+	// Initialize the directory for the new group.
+	if err := os.Mkdir(filepath.Join(g.root, name), dirPerms); err != nil {
+		return errors.Wrap(err, "making group directory")
+	}
+	if err := touch(filepath.Join(g.root, name, dotCurrent)); err != nil {
+		return errors.Wrap(err, "creating "+dotCurrent)
+	}
+	return g.setCurrent(name)
+}
+
 // Open opens the Group with the provided name and sets it to the current Group.
+// If there is no Group with the provided name then this method initializes a new one.
 func (g *Groups) Open(name string) error {
+	g.groupsMu.Lock()
+	defer g.groupsMu.Unlock()
+
+	group, ok := g.groups[name]
+	if !ok {
+		return g.initializeGroup(name)
+	}
+	if err := group.Signal(syscall.SIGKILL); err != nil {
+		return errors.Wrap(err, "sending SIGKILL to current process group")
+	}
+	info, err := os.Stat(filepath.Join(g.root, name))
+	if err != nil {
+		return err
+	}
+	if err := g.openGroupFrom(info); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -117,13 +170,41 @@ func (g *Groups) openGroupFrom(info os.FileInfo) error {
 		}
 	}
 	// If dotCurrent exists in the group directory then make it the current group.
-	if _, err := os.Open(filepath.Join(gpath, dotCurrent)); !os.IsNotExist(err) {
-		g.cur = group
+	if _, err := os.Stat(filepath.Join(gpath, dotCurrent)); !os.IsNotExist(err) {
+		g.cur = info.Name()
 	}
+	g.groupsMu.Lock()
+	g.groups[info.Name()] = group
+	g.groupsMu.Unlock()
 	return nil
 }
 
-const dirPerms = 0755
+// setCurrent sets the current group.
+func (g *Groups) setCurrent(name string) error {
+	// Early out if there is no current group.
+	if g.cur == "" {
+		g.cur = name
+		return nil
+	}
+	// Remove dotCurrent from the current group
+	if err := os.Remove(filepath.Join(g.root, g.cur, dotCurrent)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	g.cur = name
+	return nil
+}
+
+// Start starts a process in the current group.
+func (g *Groups) Start(cmd *exec.Cmd) error {
+	cur := g.Current()
+	if cur == nil {
+		return errors.New("no current group")
+	}
+	return cur.Start(cmd)
+}
 
 // openOrCreateDir opens a directory with the provided path,
 // and creates it if it doesn't exist
@@ -196,6 +277,15 @@ func renewProcessFrom(gpath, existingProcPath string, group *Group) error {
 		Args: cmd.Args,
 		Env:  cmd.Env,
 	})
+}
+
+// touch touches a file.
+func touch(name string) error {
+	f, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // command is a utility type used to encode/decode commands.
