@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3" // Load sqlite driver.
 	"github.com/pkg/errors"
 )
 
@@ -237,46 +237,59 @@ func (g *Groups) getCommandEnv(cid int) ([]string, error) {
 }
 
 const getGroupCommands = `
-SELECT		command_id, path, arg, env
+SELECT		cmd.command_id, arg, env_var
 FROM		commands cmd
 LEFT JOIN	command_args args
 ON		cmd.command_id = args.command_id
 LEFT JOIN	command_env env
-ON		cmd.command_id = groups.group_id
+ON		cmd.command_id = env.command_id
 WHERE		cmd.group_name = ?`
 
 // getGroupCommands gets the command ID's for a group.
-func (g *Groups) getGroupCommands(groupName string) (map[int]*command, error) {
+func (g *Groups) getGroupCommands(groupName string) ([]*Cmd, error) {
 	rows, err := g.db.Query(getGroupCommands, groupName)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }() // Best effort.
 
-	commands := map[int]*command{}
+	commandsMap := map[string]*Cmd{}
 
 	for rows.Next() {
 		var (
-			cid    int
-			path   string
-			arg    = sql.NullString{}
-			envvar = sql.NullString{}
+			commandID string
+			arg       = sql.NullString{}
+			envvar    = sql.NullString{}
 		)
-		if err := rows.Scan(&cid, &arg, &envvar); err != nil {
+		if err := rows.Scan(&commandID, &arg, &envvar); err != nil {
 			return nil, err
 		}
-		if _, ok := commands[cid]; !ok {
-			commands[cid] = &command{Path: path}
+		if _, ok := commandsMap[commandID]; !ok {
+			commandsMap[commandID] = &Cmd{}
 		}
 		if arg.Valid {
-			commands[cid].Args = append(commands[cid].Args, arg.String)
+			commandsMap[commandID].Args = append(commandsMap[commandID].Args, arg.String)
 		}
 		if envvar.Valid {
-			commands[cid].Env = append(commands[cid].Env, envvar.String)
+			commandsMap[commandID].Env = append(commandsMap[commandID].Env, envvar.String)
 		}
 
 	}
-	return commands, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, errors.Wrap(err, "scanning group commands row")
+	}
+	var (
+		commands = make([]*Cmd, len(commandsMap))
+		i        = 0
+	)
+	for id, cmd := range commandsMap {
+		commands[i] = &Cmd{
+			Cmd: exec.Command(cmd.Args[0], cmd.Args[1:]...),
+			ID:  id,
+		}
+		i++
+	}
+	return commands, nil
 }
 
 func (g *Groups) initialize() error {
@@ -287,7 +300,7 @@ func (g *Groups) initialize() error {
 	if _, err := g.db.Exec(string(sqldata)); err != nil {
 		return errors.Wrap(err, "creating tables")
 	}
-	return nil
+	return errors.Wrap(g.startCurrent(), "starting the current group")
 }
 
 const getPid = `SELECT pid FROM commands WHERE command_id = ? LIMIT 1`
@@ -339,6 +352,52 @@ func (g *Groups) Start(cmd *Cmd) error {
 		return err
 	}
 	return errors.Wrap(tx.Commit(), "committing transaction")
+}
+
+// startCurrent ensures that the current group in the database is the currently active group.
+func (g *Groups) startCurrent() error {
+	tx, err := g.db.Begin()
+	if err != nil {
+		return errors.Wrap(err, "starting transaction")
+	}
+	if err := g.startCurrentTx(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return errors.Wrap(tx.Commit(), "committing transaction")
+}
+
+const getCurrentGroup = `
+SELECT		group_name
+FROM		groups_log
+WHERE		action_name = '` + actionSetCurrent + `'
+ORDER BY	log_sequence_number ASC
+LIMIT		1`
+
+// startCurrentTx starts the current group in the database using the provided *sql.Tx
+func (g *Groups) startCurrentTx(tx *sql.Tx) error {
+	var groupName string
+	if err := tx.QueryRow(getCurrentGroup).Scan(&groupName); err != nil {
+		if err != sql.ErrNoRows {
+			return errors.Wrap(err, "getting current group name")
+		}
+	}
+	if groupName != "" && groupName == g.curName {
+		return nil
+	}
+	if err := g.CloseCurrent(); err != nil {
+		return errors.Wrap(err, "closing current group")
+	}
+	cmds, err := g.getGroupCommands(groupName)
+	if err != nil {
+		return errors.Wrap(err, "getting group commands")
+	}
+	for _, cmd := range cmds {
+		if err := g.startTx(tx, cmd); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd) error {
