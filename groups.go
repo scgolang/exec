@@ -16,15 +16,8 @@ import (
 	"github.com/pkg/errors"
 )
 
-const (
-	// DataDir is the directory that contains the internal state of Groups
-	DataDir = ".data"
-
-	// GroupsDB is the name of the sqlite database file.
-	GroupsDB = "groups.db"
-)
-
-const dirPerms = 0755
+// DirPerms are permissions for directories created by this package.
+const DirPerms = 0755
 
 // Cmd is a command with an ID.
 // The ID should be unique per process group.
@@ -62,7 +55,7 @@ type Groups struct {
 }
 
 // NewGroups creates a new collection of persistent process groups.
-func NewGroups(root string) (*Groups, error) {
+func NewGroups(root, dbfile string) (*Groups, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -70,19 +63,18 @@ func NewGroups(root string) (*Groups, error) {
 	g := &Groups{
 		root: absRoot,
 	}
-	dataPath := filepath.Join(g.root, DataDir)
-	info, err := os.Stat(dataPath)
+	info, err := os.Stat(g.root)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := os.Mkdir(dataPath, dirPerms); err != nil {
-				return nil, errors.Wrap(err, "creating "+dataPath+" directory")
+			if err := os.Mkdir(g.root, DirPerms); err != nil {
+				return nil, errors.Wrap(err, "creating "+g.root+" directory")
 			}
 		}
 	}
 	if info != nil && !info.IsDir() {
-		return nil, errors.Wrap(err, dataPath+" is not a directory")
+		return nil, errors.Wrap(err, g.root+" is not a directory")
 	}
-	db, err := sql.Open("sqlite3", filepath.Join(root, DataDir, GroupsDB))
+	db, err := sql.Open("sqlite3", filepath.Join(root, dbfile))
 	if err != nil {
 		return nil, errors.Wrap(err, "opening db")
 	}
@@ -95,11 +87,11 @@ func NewGroups(root string) (*Groups, error) {
 
 // captureOutput captures the output of the provided command.
 func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, pid int) error {
-	stdout, err := os.Create(filepath.Join(g.root, DataDir, fmt.Sprintf("%d.stdout", pid)))
+	stdout, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%d.stdout", pid)))
 	if err != nil {
 		return errors.Wrap(err, "creating new process stdout file")
 	}
-	stderr, err := os.Create(filepath.Join(g.root, DataDir, fmt.Sprintf("%d.stderr", pid)))
+	stderr, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%d.stderr", pid)))
 	if err != nil {
 		return errors.Wrap(err, "creating new process stderr file")
 	}
@@ -287,52 +279,13 @@ func (g *Groups) getGroupCommands(groupName string) (map[int]*command, error) {
 	return commands, rows.Err()
 }
 
-const createLogTable = `
-CREATE TABLE IF NOT EXISTS groups_log (
-	log_sequence_number	INTEGER		PRIMARY KEY AUTOINCREMENT,
-	action			TEXT,
-	command_id		TEXT,
-	group_name		TEXT
-)`
-
-const createActionsIndex = `
-CREATE INDEX IF NOT EXISTS action_idx ON groups_log (log_sequence_number, action)`
-
-const createCommandsTable = `
-CREATE TABLE IF NOT EXISTS commands (
-	command_id		TEXT,
-	pid			INTEGER,
-	group_name		TEXT
-)`
-
-const createCommandArgsTable = `
-CREATE TABLE IF NOT EXISTS command_args (
-	command_id		TEXT,
-	idx			INTEGER,
-	arg			TEXT
-)`
-
-const createCommandEnvTable = `
-CREATE TABLE IF NOT EXISTS command_env (
-	command_id		TEXT,
-	idx			INTEGER,
-	env_var			TEXT
-)`
-
 func (g *Groups) initialize() error {
-	for _, s := range []struct {
-		errmsg string
-		sql    string
-	}{
-		{errmsg: "creating log table", sql: createLogTable},
-		{errmsg: "creating actions index", sql: createActionsIndex},
-		{errmsg: "creating commands table", sql: createCommandsTable},
-		{errmsg: "creating command args table", sql: createCommandArgsTable},
-		{errmsg: "creating command env table", sql: createCommandEnvTable},
-	} {
-		if _, err := g.db.Exec(s.sql); err != nil {
-			return errors.Wrap(err, s.errmsg)
-		}
+	sqldata, err := Asset("sql/createTables.sql")
+	if err != nil {
+		return errors.Wrap(err, "getting sql data")
+	}
+	if _, err := g.db.Exec(string(sqldata)); err != nil {
+		return errors.Wrap(err, "creating tables")
 	}
 	return nil
 }
@@ -358,7 +311,7 @@ func (g *Groups) Logs(commandID string, fd int) (*bufio.Scanner, error) {
 	case 2:
 		filename = fmt.Sprintf("%d.stderr", pid)
 	}
-	f, err := os.Open(filepath.Join(g.root, DataDir, filename))
+	f, err := os.Open(filepath.Join(g.root, filename))
 	if err != nil {
 		return nil, err
 	}
@@ -497,7 +450,7 @@ const (
 )
 
 func insertActions(actions ...action) (query string, args []interface{}) {
-	query = `INSERT INTO groups_log (action, command_id, group_name) VALUES`
+	query = `INSERT INTO groups_log (action_name, command_id, group_name) VALUES`
 	args = make([]interface{}, 3*len(actions))
 
 	for i, action := range actions {

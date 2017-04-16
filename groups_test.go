@@ -10,8 +10,8 @@ import (
 )
 
 func newTestGroups(t *testing.T) *exec.Groups {
-	_ = os.RemoveAll(exec.DataDir)
-	gs, err := exec.NewGroups(".")
+	_ = os.RemoveAll(".data")
+	gs, err := exec.NewGroups(".data", "groups.db")
 	if err != nil {
 		t.Fatal(err)
 	}
