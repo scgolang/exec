@@ -2,7 +2,6 @@ package exec
 
 import (
 	"os"
-	"os/exec"
 	"time"
 
 	"github.com/pkg/errors"
@@ -13,8 +12,8 @@ type Pid int
 
 // Group runs a set of commands.
 type Group struct {
-	cmds   []*exec.Cmd
-	done   chan *exec.Cmd
+	cmds   []*Cmd
+	done   chan *Cmd
 	errors chan CmdError
 }
 
@@ -22,10 +21,15 @@ type Group struct {
 // ctx can be used to cancel the entire group of processes.
 func NewGroup() *Group {
 	return &Group{
-		cmds:   []*exec.Cmd{},
-		done:   make(chan *exec.Cmd),
+		cmds:   []*Cmd{},
+		done:   make(chan *Cmd),
 		errors: make(chan CmdError),
 	}
+}
+
+// Commands returns the commands associated with the Group.
+func (g *Group) Commands() []*Cmd {
+	return g.cmds
 }
 
 // Signal sends a signal to every process in the Group.
@@ -40,7 +44,7 @@ func (g *Group) Signal(signal os.Signal) error {
 
 // Start starts the provided command and adds it to the group.
 // It also starts a goroutine that waits for the command.
-func (g *Group) Start(cmd *exec.Cmd) error {
+func (g *Group) Start(cmd *Cmd) error {
 	// Start the process.
 	if err := cmd.Start(); err != nil {
 		return errors.Wrap(err, "starting command")

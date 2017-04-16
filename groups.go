@@ -1,10 +1,16 @@
 package exec
 
 import (
+	"bufio"
 	"database/sql"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
@@ -19,6 +25,19 @@ const (
 )
 
 const dirPerms = 0755
+
+// Cmd is a command with an ID.
+// The ID should be unique per process group.
+type Cmd struct {
+	*exec.Cmd
+	ID string
+}
+
+// CmdError is an error with a particular process.
+type CmdError struct {
+	Cmd *Cmd
+	error
+}
 
 // Groups manages a collection of Group's by persisting group information to disk.
 // A group of processes is represented as a set of directories whose names are the PID's of the processes.
@@ -74,32 +93,95 @@ func NewGroups(root string) (*Groups, error) {
 	return g, nil
 }
 
-// Close closes the current Group.
-func (g *Groups) Close() error {
+// captureOutput captures the output of the provided command.
+func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, pid int) error {
+	stdout, err := os.Create(filepath.Join(g.root, DataDir, fmt.Sprintf("%d.stdout", pid)))
+	if err != nil {
+		return errors.Wrap(err, "creating new process stdout file")
+	}
+	stderr, err := os.Create(filepath.Join(g.root, DataDir, fmt.Sprintf("%d.stderr", pid)))
+	if err != nil {
+		return errors.Wrap(err, "creating new process stderr file")
+	}
+	go func() { _, _ = io.Copy(stdout, outPipe) }()
+	go func() { _, _ = io.Copy(stderr, errPipe) }()
 	return nil
 }
 
-// Create creates a new group with the provided name.
-func (g *Groups) Create(groupName string) error {
+// CloseCurrent closes the current Group.
+func (g *Groups) CloseCurrent() error {
+	if g.cur == nil {
+		return nil
+	}
 	tx, err := g.db.Begin()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "starting transaction")
 	}
-	// TODO: remove current group if there is one
-	query, args := insertActions([]action{
-		{actionGroupCreate, "", groupName},
-		{actionSetCurrent, "", groupName},
-	}...)
-	if _, err := tx.Exec(query, args...); err != nil {
+	if err := g.closeTx(tx); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "committing transaction")
+	}
+	g.cur = nil
+	return nil
+}
+
+// closeTx closes the current group and logs info about the
+// closed commands using the provided *sql.Tx
+func (g *Groups) closeTx(tx *sql.Tx) error {
+	var (
+		cmds    = g.cur.Commands()
+		actions = make([]action, len(cmds))
+	)
+	for i, cmd := range cmds {
+		actions[i] = action{
+			key:       actionCmdStop,
+			commandID: cmd.ID,
+			groupName: g.curName,
+		}
+	}
+	query, args := insertActions(actions...)
+	if _, err := tx.Exec(query, args...); err != nil {
+		return errors.Wrap(err, "inserting actions")
+	}
+	if err := g.cur.Signal(syscall.SIGKILL); err != nil {
+		if !strings.HasSuffix(err.Error(), "process already finished") {
+			return errors.Wrap(err, "signalling current process group")
+		}
+	}
+	if err := g.cur.Wait(2 * time.Second); err != nil {
+		return errors.Wrap(err, "waiting for process group")
+	}
+	return nil
+}
+
+// Create creates a new group with the provided name.
+func (g *Groups) Create(groupName string, cmds ...*Cmd) error {
+	tx, err := g.db.Begin()
+	if err != nil {
+		return err
+	}
+	// TODO: kill current group if there is one
+	query, args := insertActions(
+		action{actionGroupCreate, "", groupName},
+		action{actionSetCurrent, "", groupName},
+	)
+	if _, err := tx.Exec(query, args...); err != nil {
+		_ = tx.Rollback()
 		return err
 	}
 	g.cur = NewGroup()
 	g.curName = groupName
-	return nil
+
+	for _, cmd := range cmds {
+		if err := g.startTx(tx, cmd); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return errors.Wrap(tx.Commit(), "committing transaction")
 }
 
 const getCurrent = `
@@ -219,6 +301,7 @@ CREATE INDEX IF NOT EXISTS action_idx ON groups_log (log_sequence_number, action
 const createCommandsTable = `
 CREATE TABLE IF NOT EXISTS commands (
 	command_id		TEXT,
+	pid			INTEGER,
 	group_name		TEXT
 )`
 
@@ -254,67 +337,43 @@ func (g *Groups) initialize() error {
 	return nil
 }
 
+const getPid = `SELECT pid FROM commands WHERE command_id = ? LIMIT 1`
+
+// Logs returns a *bufio.Scanner that can be used to
+// read the logs of a process in the current group.
+// Pass 1 to get stdout and 2 to get stderr.
+func (g *Groups) Logs(commandID string, fd int) (*bufio.Scanner, error) {
+	var (
+		filename string
+		pid      int
+	)
+	if err := g.db.QueryRow(getPid, commandID).Scan(&pid); err != nil {
+		return nil, errors.Wrap(err, "querying pid for command "+commandID)
+	}
+	switch fd {
+	default:
+		return nil, errors.Errorf("fd (%d) must be either 1 (stdout) or 2 (stderr)", fd)
+	case 1:
+		filename = fmt.Sprintf("%d.stdout", pid)
+	case 2:
+		filename = fmt.Sprintf("%d.stderr", pid)
+	}
+	f, err := os.Open(filepath.Join(g.root, DataDir, filename))
+	if err != nil {
+		return nil, err
+	}
+	return bufio.NewScanner(f), nil
+}
+
 // Open opens the Group with the provided name and sets it to the current Group.
 // If there is no Group with the provided name then this method initializes a new one.
 func (g *Groups) Open(name string) error {
 	return nil
 }
 
-// startGroup starts all the processes for the named group and sets it to the current group.
-func (g *Groups) startGroup(groupName string) error {
-	// // TODO: get rid of n+1
-	// cids, err := g.getGroupCommands(groupName)
-	// if err != nil {
-	// 	return errors.Wrap(err, "getting group commands")
-	// }
-	// for _, cid := range cids {
-	// }
-	// // Decode the existing process file and start a new process.
-	// procFile, err := os.Create(filepath.Join(existingProcPath, processFile))
-	// if err != nil {
-	// 	return errors.Wrap(err, "creating new process file")
-	// }
-	// cmdenc := command{}
-	// if err := json.NewDecoder(procFile).Decode(&cmdenc); err != nil {
-	// 	return errors.Wrap(err, "decoding "+processFile)
-	// }
-	// // Args should always have the command name at index 0
-	// cmd := exec.Command(cmdenc.Path, cmdenc.Args[1:]...)
-
-	// // TODO: will we need to modify the env of the new process?
-	// cmd.Env = cmdenc.Env
-
-	// stdoutPipe, err := cmd.StdoutPipe()
-	// if err != nil {
-	// 	return errors.Wrap(err, "getting stdout pipe")
-	// }
-	// stderrPipe, err := cmd.StderrPipe()
-	// if err != nil {
-	// 	return errors.Wrap(err, "getting stderr pipe")
-	// }
-	// if err := group.Start(cmd); err != nil {
-	// 	return err
-	// }
-	// procPath := filepath.Join(gpath, strconv.Itoa(cmd.Process.Pid))
-	// if err := os.Mkdir(procPath, dirPerms); err != nil {
-	// 	return errors.Wrap(err, "making new process directory")
-	// }
-	// // Pipe stdout and stderr.
-	// stdout, err := os.Create(filepath.Join(procPath, stdoutFile))
-	// if err != nil {
-	// 	return errors.Wrap(err, "creating new process stdout file")
-	// }
-	// stderr, err := os.Create(filepath.Join(procPath, stderrFile))
-	// if err != nil {
-	// 	return errors.Wrap(err, "creating new process stderr file")
-	// }
-	// go func() { _, _ = io.Copy(stdout, stdoutPipe) }()
-	// go func() { _, _ = io.Copy(stderr, stderrPipe) }()
-	return nil
-}
-
 // Start starts a process in the current group.
-func (g *Groups) Start(commandID string, cmd *exec.Cmd) error {
+func (g *Groups) Start(cmd *Cmd) error {
+	// Early out if there are no groups yet.
 	if g.cur == nil {
 		return errors.New("no current group")
 	}
@@ -322,39 +381,53 @@ func (g *Groups) Start(commandID string, cmd *exec.Cmd) error {
 	if err != nil {
 		return errors.Wrap(err, "starting transaction")
 	}
-	if err := insertCmd(tx, g.curName, commandID, cmd); err != nil {
+	if err := g.startTx(tx, cmd); err != nil {
 		_ = tx.Rollback()
-		return errors.Wrap(err, "inserting new command")
-	}
-	if err := g.cur.Start(cmd); err != nil {
-		_ = tx.Rollback()
-		return errors.Wrap(err, "starting child process")
-	}
-	query, args := insertActions([]action{
-		{actionCmdStart, commandID, g.curName},
-	}...)
-	if _, err := tx.Exec(query, args...); err != nil {
-		_ = tx.Rollback()
-		return errors.Wrap(err, "inserting cmd start action")
+		return err
 	}
 	return errors.Wrap(tx.Commit(), "committing transaction")
 }
 
-const insertCmdQuery = `INSERT INTO commands (command_id, group_name) VALUES (?, ?)`
+func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd) error {
+	outPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return errors.Wrap(err, "getting stdout pipe")
+	}
+	errPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return errors.Wrap(err, "getting stderr pipe")
+	}
+	if err := g.cur.Start(cmd); err != nil {
+		return errors.Wrap(err, "starting child process")
+	}
+	if err := insertCmd(tx, g.curName, cmd); err != nil {
+		return errors.Wrap(err, "inserting new command")
+	}
+	if err := g.captureOutput(outPipe, errPipe, cmd.Process.Pid); err != nil {
+		return errors.Wrap(err, "capturing output of child process")
+	}
+	query, args := insertActions(
+		action{actionCmdStart, cmd.ID, g.curName},
+	)
+	_, err = tx.Exec(query, args...)
+	return errors.Wrap(err, "inserting cmd start action")
+}
+
+const insertCmdQuery = `INSERT INTO commands (command_id, pid, group_name) VALUES (?, ?, ?)`
 
 // insertCmd inserts a command in the database along with its args and environment variables.
 // Calling code is expected to roll back the transaction if this func returns an error.
-func insertCmd(tx *sql.Tx, groupName, commandID string, cmd *exec.Cmd) error {
-	if _, err := tx.Exec(insertCmdQuery, commandID, groupName); err != nil {
+func insertCmd(tx *sql.Tx, groupName string, cmd *Cmd) error {
+	if _, err := tx.Exec(insertCmdQuery, cmd.ID, cmd.Process.Pid, groupName); err != nil {
 		return errors.Wrap(err, "inserting command")
 	}
 	if len(cmd.Args) > 0 {
-		if err := insertCmdArgs(tx, commandID, cmd.Args); err != nil {
+		if err := insertCmdArgs(tx, cmd.ID, cmd.Args); err != nil {
 			return err
 		}
 	}
 	if len(cmd.Env) > 0 {
-		if err := insertCmdEnv(tx, commandID, cmd.Env); err != nil {
+		if err := insertCmdEnv(tx, cmd.ID, cmd.Env); err != nil {
 			return err
 		}
 	}
@@ -424,17 +497,18 @@ const (
 )
 
 func insertActions(actions ...action) (query string, args []interface{}) {
-	query = `INSERT INTO groups_log (action, group_name) VALUES`
-	args = make([]interface{}, 2*len(actions))
+	query = `INSERT INTO groups_log (action, command_id, group_name) VALUES`
+	args = make([]interface{}, 3*len(actions))
 
 	for i, action := range actions {
 		if i == 0 {
-			query += ` (?, ?)`
+			query += ` (?, ?, ?)`
 		} else {
-			query += `, (?, ?)`
+			query += `, (?, ?, ?)`
 		}
-		args[(i*2)+0] = action.key
-		args[(i*2)+1] = action.groupName
+		args[(i*3)+0] = action.key
+		args[(i*3)+1] = action.commandID
+		args[(i*3)+2] = action.groupName
 	}
 	return query, args
 }

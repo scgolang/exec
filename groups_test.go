@@ -3,7 +3,6 @@ package exec_test
 import (
 	"os"
 	osexec "os/exec"
-	"path/filepath"
 	"testing"
 
 	ulid "github.com/imdario/go-ulid"
@@ -11,7 +10,7 @@ import (
 )
 
 func newTestGroups(t *testing.T) *exec.Groups {
-	_ = os.Remove(filepath.Join(exec.DataDir, exec.GroupsDB))
+	_ = os.RemoveAll(exec.DataDir)
 	gs, err := exec.NewGroups(".")
 	if err != nil {
 		t.Fatal(err)
@@ -20,13 +19,31 @@ func newTestGroups(t *testing.T) *exec.Groups {
 }
 
 func TestGroups(t *testing.T) {
-	gs := newTestGroups(t)
-	if err := gs.Create("echofoo"); err != nil {
+	var (
+		commandID = ulid.New().String()
+		groupName = "echofoo"
+		gs        = newTestGroups(t)
+	)
+	if err := gs.Create(groupName); err != nil {
 		t.Fatal(err)
 	}
-	cid := ulid.New().String()
-
-	if err := gs.Start(cid, osexec.Command("echo", "foo")); err != nil {
+	if err := gs.Start(&exec.Cmd{
+		Cmd: osexec.Command("echo", "foo"),
+		ID:  commandID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := gs.Logs(commandID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scanner.Scan() {
+		t.Fatal("expected to be able to scan one line")
+	}
+	if expected, got := "foo", scanner.Text(); expected != got {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+	if err := gs.CloseCurrent(); err != nil {
 		t.Fatal(err)
 	}
 }
