@@ -2,14 +2,14 @@ CREATE TABLE IF NOT EXISTS groups_log (
 	log_sequence_number	INTEGER		PRIMARY KEY AUTOINCREMENT,
 	action_name		TEXT,
 	command_id		TEXT,
-	group_name		TEXT
+	group_name		TEXT,
+	process_id		INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS action_idx ON groups_log (log_sequence_number, action_name);
 
 CREATE TABLE IF NOT EXISTS commands (
 	command_id		TEXT,
-	pid			INTEGER,
 	group_name		TEXT
 );
 

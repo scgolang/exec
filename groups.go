@@ -124,6 +124,7 @@ func (g *Groups) closeTx(tx *sql.Tx, groupName string, grp *Group) error {
 			key:       actionCmdStop,
 			commandID: cmd.ID,
 			groupName: groupName,
+			processID: cmd.Process.Pid,
 		}
 	}
 	query, args := insertActions(actions...)
@@ -155,7 +156,11 @@ func (g *Groups) Create(groupName string, cmds ...*Cmd) error {
 
 func (g *Groups) createTx(tx *sql.Tx, groupName string, cmds ...*Cmd) error {
 	query, args := insertActions(
-		action{actionGroupCreate, "", groupName},
+		action{
+			key:       actionGroupCreate,
+			commandID: "",
+			groupName: groupName,
+		},
 	)
 	if _, err := tx.Exec(query, args...); err != nil {
 		return err
@@ -290,7 +295,13 @@ func (g *Groups) initialize() error {
 	return errors.Wrap(err, "creating tables")
 }
 
-const getPid = `SELECT pid FROM commands WHERE command_id = ? LIMIT 1`
+const getPid = `
+SELECT		process_id
+FROM		groups_log
+WHERE		action_name = '` + actionCmdStart + `'
+AND		command_id = ?
+ORDER BY	log_sequence_number DESC
+LIMIT		1`
 
 // Logs returns a *bufio.Scanner that can be used to
 // read the logs of a process in the current group.
@@ -343,18 +354,23 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) err
 		return errors.Wrap(err, "capturing output of child process")
 	}
 	query, args := insertActions(
-		action{actionCmdStart, cmd.ID, groupName},
+		action{
+			key:       actionCmdStart,
+			commandID: cmd.ID,
+			groupName: groupName,
+			processID: cmd.Process.Pid,
+		},
 	)
 	_, err = tx.Exec(query, args...)
 	return errors.Wrap(err, "inserting cmd start action")
 }
 
-const insertCmdQuery = `INSERT INTO commands (command_id, pid, group_name) VALUES (?, ?, ?)`
+const insertCmdQuery = `INSERT INTO commands (command_id, group_name) VALUES (?, ?)`
 
 // insertCmd inserts a command in the database along with its args and environment variables.
 // Calling code is expected to roll back the transaction if this func returns an error.
 func insertCmd(tx *sql.Tx, groupName string, cmd *Cmd) error {
-	if _, err := tx.Exec(insertCmdQuery, cmd.ID, cmd.Process.Pid, groupName); err != nil {
+	if _, err := tx.Exec(insertCmdQuery, cmd.ID, groupName); err != nil {
 		return errors.Wrap(err, "inserting command")
 	}
 	if len(cmd.Args) > 0 {
@@ -421,6 +437,7 @@ type action struct {
 	key       string
 	commandID string
 	groupName string
+	processID int
 }
 
 // Actions
@@ -432,18 +449,19 @@ const (
 )
 
 func insertActions(actions ...action) (query string, args []interface{}) {
-	query = `INSERT INTO groups_log (action_name, command_id, group_name) VALUES`
-	args = make([]interface{}, 3*len(actions))
+	query = `INSERT INTO groups_log (action_name, command_id, group_name, process_id) VALUES`
+	args = make([]interface{}, 4*len(actions))
 
 	for i, action := range actions {
 		if i == 0 {
-			query += ` (?, ?, ?)`
+			query += ` (?, ?, ?, ?)`
 		} else {
-			query += `, (?, ?, ?)`
+			query += `, (?, ?, ?, ?)`
 		}
 		args[(i*3)+0] = action.key
 		args[(i*3)+1] = action.commandID
 		args[(i*3)+2] = action.groupName
+		args[(i*3)+3] = action.processID
 	}
 	return query, args
 }

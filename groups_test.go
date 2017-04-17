@@ -9,9 +9,9 @@ import (
 	"github.com/scgolang/exec"
 )
 
-func newTestGroups(t *testing.T) *exec.Groups {
+func newTestGroups(t *testing.T, root string) *exec.Groups {
 	_ = os.RemoveAll(".data")
-	gs, err := exec.NewGroups(".data", "groups.db")
+	gs, err := exec.NewGroups(root, "groups.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestGroups(t *testing.T) {
 			},
 		}
 		groupName = "echofoo"
-		gs        = newTestGroups(t)
+		gs        = newTestGroups(t, ".data")
 	)
 	if err := gs.Create(groupName, commands...); err != nil {
 		t.Fatal(err)
@@ -46,4 +46,8 @@ func TestGroups(t *testing.T) {
 	if err := gs.Close(groupName); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestGroupsOpen(t *testing.T) {
+	_ = newTestGroups(t, ".echofoo")
 }
