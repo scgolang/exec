@@ -21,16 +21,16 @@ func newTestGroups(t *testing.T) *exec.Groups {
 func TestGroups(t *testing.T) {
 	var (
 		commandID = ulid.New().String()
+		commands  = []*exec.Cmd{
+			&exec.Cmd{
+				Cmd: osexec.Command("echo", "foo"),
+				ID:  commandID,
+			},
+		}
 		groupName = "echofoo"
 		gs        = newTestGroups(t)
 	)
-	if err := gs.Create(groupName); err != nil {
-		t.Fatal(err)
-	}
-	if err := gs.Start(&exec.Cmd{
-		Cmd: osexec.Command("echo", "foo"),
-		ID:  commandID,
-	}); err != nil {
+	if err := gs.Create(groupName, commands...); err != nil {
 		t.Fatal(err)
 	}
 	scanner, err := gs.Logs(commandID, 1)
@@ -43,7 +43,7 @@ func TestGroups(t *testing.T) {
 	if expected, got := "foo", scanner.Text(); expected != got {
 		t.Fatalf("expected %s, got %s", expected, got)
 	}
-	if err := gs.CloseCurrent(); err != nil {
+	if err := gs.Close(groupName); err != nil {
 		t.Fatal(err)
 	}
 }

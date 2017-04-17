@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,19 +34,10 @@ type CmdError struct {
 }
 
 // Groups manages a collection of Group's by persisting group information to disk.
-// A group of processes is represented as a set of directories whose names are the PID's of the processes.
-//
-// Each directory contains the following files:
-// * process.json is used to persist the necessary information to run the command, e.g. command args, environment variables
-// * .stdout and .stderr contain whatever the process has output on stdout and stderr
-// * .current will exist in the directory of the group that is the currently open group
-//
 type Groups struct {
-	// cur is the currently open process group.
-	cur *Group
-
-	// curName is the name of the current process group.
-	curName string
+	// groups is a map from group name to Group.
+	groups   map[string]*Group
+	groupsMu sync.RWMutex
 
 	// db is a database handle.
 	db *sql.DB
@@ -61,7 +53,8 @@ func NewGroups(root, dbfile string) (*Groups, error) {
 		return nil, err
 	}
 	g := &Groups{
-		root: absRoot,
+		groups: map[string]*Group{},
+		root:   absRoot,
 	}
 	info, err := os.Stat(g.root)
 	if err != nil {
@@ -100,94 +93,83 @@ func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, pid int) error {
 	return nil
 }
 
-// CloseCurrent closes the current Group.
-func (g *Groups) CloseCurrent() error {
-	if g.cur == nil {
+// Close closes a Group.
+func (g *Groups) Close(groupName string) error {
+	grp := g.getGroup(groupName)
+	if grp == nil {
 		return nil
 	}
 	tx, err := g.db.Begin()
 	if err != nil {
 		return errors.Wrap(err, "starting transaction")
 	}
-	if err := g.closeTx(tx); err != nil {
+	if err := g.closeTx(tx, groupName, grp); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.Wrap(err, "committing transaction")
 	}
-	g.cur = nil
 	return nil
 }
 
-// closeTx closes the current group and logs info about the
-// closed commands using the provided *sql.Tx
-func (g *Groups) closeTx(tx *sql.Tx) error {
+// closeTx closes a group ands updates the database using the provided Tx.
+func (g *Groups) closeTx(tx *sql.Tx, groupName string, grp *Group) error {
 	var (
-		cmds    = g.cur.Commands()
+		cmds    = grp.Commands()
 		actions = make([]action, len(cmds))
 	)
 	for i, cmd := range cmds {
 		actions[i] = action{
 			key:       actionCmdStop,
 			commandID: cmd.ID,
-			groupName: g.curName,
+			groupName: groupName,
 		}
 	}
 	query, args := insertActions(actions...)
 	if _, err := tx.Exec(query, args...); err != nil {
 		return errors.Wrap(err, "inserting actions")
 	}
-	if err := g.cur.Signal(syscall.SIGKILL); err != nil {
+	if err := grp.Signal(syscall.SIGKILL); err != nil {
 		if !strings.HasSuffix(err.Error(), "process already finished") {
-			return errors.Wrap(err, "signalling current process group")
+			return errors.Wrap(err, "signalling process group")
 		}
 	}
-	if err := g.cur.Wait(2 * time.Second); err != nil {
-		return errors.Wrap(err, "waiting for process group")
-	}
-	return nil
+	// Arbitrary timeout.
+	return errors.Wrap(grp.Wait(2*time.Second), "waiting for process group")
 }
 
 // Create creates a new group with the provided name.
+// To start the group use the Start method.
 func (g *Groups) Create(groupName string, cmds ...*Cmd) error {
 	tx, err := g.db.Begin()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "starting transaction")
 	}
-	// TODO: kill current group if there is one
-	query, args := insertActions(
-		action{actionGroupCreate, "", groupName},
-		action{actionSetCurrent, "", groupName},
-	)
-	if _, err := tx.Exec(query, args...); err != nil {
+	if err := g.createTx(tx, groupName, cmds...); err != nil {
 		_ = tx.Rollback()
 		return err
-	}
-	g.cur = NewGroup()
-	g.curName = groupName
-
-	for _, cmd := range cmds {
-		if err := g.startTx(tx, cmd); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
 	}
 	return errors.Wrap(tx.Commit(), "committing transaction")
 }
 
-const getCurrent = `
-SELECT		group_name
-FROM		groups_log
-WHERE		action = '` + actionSetCurrent + `'
-ORDER BY	log_sequence_number DESC
-LIMIT		1`
-
-// GetCurrent gets the current process group.
-func (g *Groups) GetCurrent() (int, error) {
-	var gid int
-	err := g.db.QueryRow(getCurrent).Scan(&gid)
-	return gid, err
+func (g *Groups) createTx(tx *sql.Tx, groupName string, cmds ...*Cmd) error {
+	query, args := insertActions(
+		action{actionGroupCreate, "", groupName},
+	)
+	if _, err := tx.Exec(query, args...); err != nil {
+		return err
+	}
+	grp := NewGroup()
+	for _, cmd := range cmds {
+		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
+			return errors.Wrap(err, "starting command")
+		}
+	}
+	g.groupsMu.Lock()
+	g.groups[groupName] = grp
+	g.groupsMu.Unlock()
+	return nil
 }
 
 const getCommandArgs = `
@@ -234,6 +216,13 @@ func (g *Groups) getCommandEnv(cid int) ([]string, error) {
 		env = append(env, e)
 	}
 	return env, rows.Err()
+}
+
+func (g *Groups) getGroup(name string) *Group {
+	g.groupsMu.RLock()
+	grp := g.groups[name]
+	g.groupsMu.RUnlock()
+	return grp
 }
 
 const getGroupCommands = `
@@ -297,10 +286,8 @@ func (g *Groups) initialize() error {
 	if err != nil {
 		return errors.Wrap(err, "getting sql data")
 	}
-	if _, err := g.db.Exec(string(sqldata)); err != nil {
-		return errors.Wrap(err, "creating tables")
-	}
-	return errors.Wrap(g.startCurrent(), "starting the current group")
+	_, err = g.db.Exec(string(sqldata))
+	return errors.Wrap(err, "creating tables")
 }
 
 const getPid = `SELECT pid FROM commands WHERE command_id = ? LIMIT 1`
@@ -337,70 +324,7 @@ func (g *Groups) Open(name string) error {
 	return nil
 }
 
-// Start starts a process in the current group.
-func (g *Groups) Start(cmd *Cmd) error {
-	// Early out if there are no groups yet.
-	if g.cur == nil {
-		return errors.New("no current group")
-	}
-	tx, err := g.db.Begin()
-	if err != nil {
-		return errors.Wrap(err, "starting transaction")
-	}
-	if err := g.startTx(tx, cmd); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return errors.Wrap(tx.Commit(), "committing transaction")
-}
-
-// startCurrent ensures that the current group in the database is the currently active group.
-func (g *Groups) startCurrent() error {
-	tx, err := g.db.Begin()
-	if err != nil {
-		return errors.Wrap(err, "starting transaction")
-	}
-	if err := g.startCurrentTx(tx); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return errors.Wrap(tx.Commit(), "committing transaction")
-}
-
-const getCurrentGroup = `
-SELECT		group_name
-FROM		groups_log
-WHERE		action_name = '` + actionSetCurrent + `'
-ORDER BY	log_sequence_number ASC
-LIMIT		1`
-
-// startCurrentTx starts the current group in the database using the provided *sql.Tx
-func (g *Groups) startCurrentTx(tx *sql.Tx) error {
-	var groupName string
-	if err := tx.QueryRow(getCurrentGroup).Scan(&groupName); err != nil {
-		if err != sql.ErrNoRows {
-			return errors.Wrap(err, "getting current group name")
-		}
-	}
-	if groupName != "" && groupName == g.curName {
-		return nil
-	}
-	if err := g.CloseCurrent(); err != nil {
-		return errors.Wrap(err, "closing current group")
-	}
-	cmds, err := g.getGroupCommands(groupName)
-	if err != nil {
-		return errors.Wrap(err, "getting group commands")
-	}
-	for _, cmd := range cmds {
-		if err := g.startTx(tx, cmd); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd) error {
+func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) error {
 	outPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return errors.Wrap(err, "getting stdout pipe")
@@ -409,17 +333,17 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd) error {
 	if err != nil {
 		return errors.Wrap(err, "getting stderr pipe")
 	}
-	if err := g.cur.Start(cmd); err != nil {
+	if err := grp.Start(cmd); err != nil {
 		return errors.Wrap(err, "starting child process")
 	}
-	if err := insertCmd(tx, g.curName, cmd); err != nil {
+	if err := insertCmd(tx, groupName, cmd); err != nil {
 		return errors.Wrap(err, "inserting new command")
 	}
 	if err := g.captureOutput(outPipe, errPipe, cmd.Process.Pid); err != nil {
 		return errors.Wrap(err, "capturing output of child process")
 	}
 	query, args := insertActions(
-		action{actionCmdStart, cmd.ID, g.curName},
+		action{actionCmdStart, cmd.ID, groupName},
 	)
 	_, err = tx.Exec(query, args...)
 	return errors.Wrap(err, "inserting cmd start action")
@@ -505,7 +429,6 @@ const (
 	actionCmdStop     = "command_stop"
 	actionGroupCreate = "group_create"
 	actionGroupRemove = "group_remove"
-	actionSetCurrent  = "set_current"
 )
 
 func insertActions(actions ...action) (query string, args []interface{}) {
