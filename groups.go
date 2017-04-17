@@ -95,7 +95,7 @@ func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, pid int) error {
 
 // Close closes a Group.
 func (g *Groups) Close(groupName string) error {
-	grp := g.getGroup(groupName)
+	grp := g.GetGroup(groupName)
 	if grp == nil {
 		return nil
 	}
@@ -223,7 +223,8 @@ func (g *Groups) getCommandEnv(cid int) ([]string, error) {
 	return env, rows.Err()
 }
 
-func (g *Groups) getGroup(name string) *Group {
+// GetGroup gets a named group.
+func (g *Groups) GetGroup(name string) *Group {
 	g.groupsMu.RLock()
 	grp := g.groups[name]
 	g.groupsMu.RUnlock()
@@ -239,9 +240,9 @@ LEFT JOIN	command_env env
 ON		cmd.command_id = env.command_id
 WHERE		cmd.group_name = ?`
 
-// getGroupCommands gets the command ID's for a group.
-func (g *Groups) getGroupCommands(groupName string) ([]*Cmd, error) {
-	rows, err := g.db.Query(getGroupCommands, groupName)
+// getGroupCommandsTx gets the command ID's for a group.
+func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*Cmd, error) {
+	rows, err := tx.Query(getGroupCommands, groupName)
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +334,30 @@ func (g *Groups) Logs(commandID string, fd int) (*bufio.Scanner, error) {
 // If there is no Group with the provided name then this method initializes a new one.
 func (g *Groups) Open(name string) error {
 	return nil
+}
+
+// Start starts all the processes in the specified group.
+func (g *Groups) Start(groupName string) error {
+	tx, err := g.db.Begin()
+	if err != nil {
+		return errors.Wrap(err, "starting transaction")
+	}
+	cmds, err := g.getGroupCommandsTx(tx, groupName)
+	if err != nil {
+		_ = tx.Rollback()
+		return errors.Wrap(err, "getting group commands")
+	}
+	grp := NewGroup()
+	for _, cmd := range cmds {
+		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
+			_ = tx.Rollback()
+			return errors.Wrap(err, "starting command")
+		}
+	}
+	g.groupsMu.Lock()
+	g.groups[groupName] = grp
+	g.groupsMu.Unlock()
+	return errors.Wrap(tx.Commit(), "committing transaction")
 }
 
 func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) error {

@@ -4,13 +4,14 @@ import (
 	"os"
 	osexec "os/exec"
 	"testing"
+	"time"
 
 	ulid "github.com/imdario/go-ulid"
 	"github.com/scgolang/exec"
 )
 
 func newTestGroups(t *testing.T, root string) *exec.Groups {
-	_ = os.RemoveAll(".data")
+	_ = os.RemoveAll(root)
 	gs, err := exec.NewGroups(root, "groups.db")
 	if err != nil {
 		t.Fatal(err)
@@ -33,6 +34,9 @@ func TestGroups(t *testing.T) {
 	if err := gs.Create(groupName, commands...); err != nil {
 		t.Fatal(err)
 	}
+	if err := gs.GetGroup(groupName).Wait(100 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
 	scanner, err := gs.Logs(commandID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -42,9 +46,6 @@ func TestGroups(t *testing.T) {
 	}
 	if expected, got := "foo", scanner.Text(); expected != got {
 		t.Fatalf("expected %s, got %s", expected, got)
-	}
-	if err := gs.Close(groupName); err != nil {
-		t.Fatal(err)
 	}
 }
 
