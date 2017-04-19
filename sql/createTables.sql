@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS groups_log (
 CREATE INDEX IF NOT EXISTS action_idx ON groups_log (log_sequence_number, action_name);
 
 CREATE TABLE IF NOT EXISTS commands (
-	command_id		TEXT,
+	command_id		TEXT		PRIMARY KEY,
 	group_name		TEXT
 );
 

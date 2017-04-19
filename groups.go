@@ -141,7 +141,6 @@ func (g *Groups) closeTx(tx *sql.Tx, groupName string, grp *Group) error {
 }
 
 // Create creates a new group with the provided name.
-// To start the group use the Start method.
 func (g *Groups) Create(groupName string, cmds ...*Cmd) error {
 	tx, err := g.db.Begin()
 	if err != nil {
@@ -169,6 +168,9 @@ func (g *Groups) createTx(tx *sql.Tx, groupName string, cmds ...*Cmd) error {
 	for _, cmd := range cmds {
 		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
 			return errors.Wrap(err, "starting command")
+		}
+		if err := insertCmd(tx, groupName, cmd); err != nil {
+			return errors.Wrap(err, "inserting new command")
 		}
 	}
 	g.groupsMu.Lock()
@@ -260,7 +262,7 @@ func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*Cmd, error
 			return nil, err
 		}
 		if _, ok := commandsMap[commandID]; !ok {
-			commandsMap[commandID] = &Cmd{}
+			commandsMap[commandID] = &Cmd{Cmd: &exec.Cmd{}, ID: commandID}
 		}
 		if arg.Valid {
 			commandsMap[commandID].Args = append(commandsMap[commandID].Args, arg.String)
@@ -318,32 +320,33 @@ func (g *Groups) Logs(commandID string, fd int) (*bufio.Scanner, error) {
 
 // Open opens the Group with the provided name and sets it to the current Group.
 // If there is no Group with the provided name then this method initializes a new one.
-func (g *Groups) Open(name string) error {
-	return nil
-}
-
-// Start starts all the processes in the specified group.
-func (g *Groups) Start(groupName string) error {
+func (g *Groups) Open(groupName string) ([]*Cmd, error) {
 	tx, err := g.db.Begin()
 	if err != nil {
-		return errors.Wrap(err, "starting transaction")
+		return nil, errors.Wrap(err, "starting transaction")
 	}
 	cmds, err := g.getGroupCommandsTx(tx, groupName)
 	if err != nil {
-		_ = tx.Rollback()
-		return errors.Wrap(err, "getting group commands")
+		return nil, errors.Wrap(err, "getting group commands")
 	}
 	grp := NewGroup()
-	for _, cmd := range cmds {
-		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
-			_ = tx.Rollback()
-			return errors.Wrap(err, "starting command")
-		}
+	if err := g.openTx(tx, groupName, grp, cmds...); err != nil {
+		_ = tx.Rollback()
+		return nil, err
 	}
 	g.groupsMu.Lock()
 	g.groups[groupName] = grp
 	g.groupsMu.Unlock()
-	return errors.Wrap(tx.Commit(), "committing transaction")
+	return cmds, errors.Wrap(tx.Commit(), "committing transaction")
+}
+
+func (g *Groups) openTx(tx *sql.Tx, groupName string, grp *Group, cmds ...*Cmd) error {
+	for _, cmd := range cmds {
+		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) error {
@@ -360,9 +363,6 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) err
 	}
 	if err := grp.Start(cmd); err != nil {
 		return errors.Wrap(err, "starting child process")
-	}
-	if err := insertCmd(tx, groupName, cmd); err != nil {
-		return errors.Wrap(err, "inserting new command")
 	}
 	query, args := insertActions(
 		action{

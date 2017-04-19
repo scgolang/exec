@@ -9,8 +9,47 @@ import (
 	"github.com/scgolang/exec"
 )
 
-func newTestGroups(t *testing.T, root string) *exec.Groups {
+const (
+	testGroupName = "echofoo"
+)
+
+var (
+	echofooCommandID = uuid.NewV4().String()
+)
+
+func TestGroups(t *testing.T) {
+	const root = ".data"
+
 	_ = os.RemoveAll(root)
+
+	var (
+		commands = []*exec.Cmd{
+			&exec.Cmd{
+				Cmd: osexec.Command("echo", "foo"),
+				ID:  echofooCommandID,
+			},
+		}
+		gs = newTestGroups(t, root)
+	)
+	if err := gs.Create(testGroupName, commands...); err != nil {
+		t.Fatal(err)
+	}
+	verifyEchoFoo(gs, echofooCommandID, t)
+}
+
+func TestGroupsOpen(t *testing.T) {
+	gs := newTestGroups(t, ".echofoo")
+	cmds, err := gs.Open(testGroupName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expected, got := 1, len(cmds); expected != got {
+		t.Fatalf("expected %d, got %d", expected, got)
+	}
+	verifyEchoFoo(gs, cmds[0].ID, t)
+}
+
+func newTestGroups(t *testing.T, root string) *exec.Groups {
 	gs, err := exec.NewGroups(root, "groups.db")
 	if err != nil {
 		t.Fatal(err)
@@ -18,22 +57,8 @@ func newTestGroups(t *testing.T, root string) *exec.Groups {
 	return gs
 }
 
-func TestGroups(t *testing.T) {
-	var (
-		commandID = uuid.NewV4().String()
-		commands  = []*exec.Cmd{
-			&exec.Cmd{
-				Cmd: osexec.Command("echo", "foo"),
-				ID:  commandID,
-			},
-		}
-		groupName = "echofoo"
-		gs        = newTestGroups(t, ".data")
-	)
-	if err := gs.Create(groupName, commands...); err != nil {
-		t.Fatal(err)
-	}
-	if err := gs.Wait(groupName); err != nil {
+func verifyEchoFoo(gs *exec.Groups, commandID string, t *testing.T) {
+	if err := gs.Wait(testGroupName); err != nil {
 		t.Fatal(err)
 	}
 	scanner, err := gs.Logs(commandID, 1)
@@ -46,8 +71,4 @@ func TestGroups(t *testing.T) {
 	if expected, got := "foo", scanner.Text(); expected != got {
 		t.Fatalf("expected %s, got %s", expected, got)
 	}
-}
-
-func TestGroupsOpen(t *testing.T) {
-	_ = newTestGroups(t, ".echofoo")
 }
