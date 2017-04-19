@@ -4,9 +4,8 @@ import (
 	"os"
 	osexec "os/exec"
 	"testing"
-	"time"
 
-	ulid "github.com/imdario/go-ulid"
+	uuid "github.com/satori/go.uuid"
 	"github.com/scgolang/exec"
 )
 
@@ -21,7 +20,7 @@ func newTestGroups(t *testing.T, root string) *exec.Groups {
 
 func TestGroups(t *testing.T) {
 	var (
-		commandID = ulid.New().String()
+		commandID = uuid.NewV4().String()
 		commands  = []*exec.Cmd{
 			&exec.Cmd{
 				Cmd: osexec.Command("echo", "foo"),
@@ -34,7 +33,7 @@ func TestGroups(t *testing.T) {
 	if err := gs.Create(groupName, commands...); err != nil {
 		t.Fatal(err)
 	}
-	if err := gs.GetGroup(groupName).Wait(100 * time.Millisecond); err != nil {
+	if err := gs.Wait(groupName); err != nil {
 		t.Fatal(err)
 	}
 	scanner, err := gs.Logs(commandID, 1)

@@ -79,23 +79,23 @@ func NewGroups(root, dbfile string) (*Groups, error) {
 }
 
 // captureOutput captures the output of the provided command.
-func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, pid int) error {
-	stdout, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%d.stdout", pid)))
+func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, commandID string) error {
+	stdout, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%s.stdout", commandID)))
 	if err != nil {
 		return errors.Wrap(err, "creating new process stdout file")
 	}
-	stderr, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%d.stderr", pid)))
+	stderr, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%s.stderr", commandID)))
 	if err != nil {
 		return errors.Wrap(err, "creating new process stderr file")
 	}
-	go func() { _, _ = io.Copy(stdout, outPipe) }()
-	go func() { _, _ = io.Copy(stderr, errPipe) }()
+	go func() { _ = filesync(stdout, outPipe) }()
+	go func() { _ = filesync(stderr, errPipe) }()
 	return nil
 }
 
 // Close closes a Group.
 func (g *Groups) Close(groupName string) error {
-	grp := g.GetGroup(groupName)
+	grp := g.getGroup(groupName)
 	if grp == nil {
 		return nil
 	}
@@ -223,8 +223,8 @@ func (g *Groups) getCommandEnv(cid int) ([]string, error) {
 	return env, rows.Err()
 }
 
-// GetGroup gets a named group.
-func (g *Groups) GetGroup(name string) *Group {
+// getGroup gets a named group.
+func (g *Groups) getGroup(name string) *Group {
 	g.groupsMu.RLock()
 	grp := g.groups[name]
 	g.groupsMu.RUnlock()
@@ -296,32 +296,18 @@ func (g *Groups) initialize() error {
 	return errors.Wrap(err, "creating tables")
 }
 
-const getPid = `
-SELECT		process_id
-FROM		groups_log
-WHERE		action_name = '` + actionCmdStart + `'
-AND		command_id = ?
-ORDER BY	log_sequence_number DESC
-LIMIT		1`
-
 // Logs returns a *bufio.Scanner that can be used to
 // read the logs of a process in the current group.
 // Pass 1 to get stdout and 2 to get stderr.
 func (g *Groups) Logs(commandID string, fd int) (*bufio.Scanner, error) {
-	var (
-		filename string
-		pid      int
-	)
-	if err := g.db.QueryRow(getPid, commandID).Scan(&pid); err != nil {
-		return nil, errors.Wrap(err, "querying pid for command "+commandID)
-	}
+	var filename string
 	switch fd {
 	default:
 		return nil, errors.Errorf("fd (%d) must be either 1 (stdout) or 2 (stderr)", fd)
 	case 1:
-		filename = fmt.Sprintf("%d.stdout", pid)
+		filename = fmt.Sprintf("%s.stdout", commandID)
 	case 2:
-		filename = fmt.Sprintf("%d.stderr", pid)
+		filename = fmt.Sprintf("%s.stderr", commandID)
 	}
 	f, err := os.Open(filepath.Join(g.root, filename))
 	if err != nil {
@@ -369,14 +355,14 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) err
 	if err != nil {
 		return errors.Wrap(err, "getting stderr pipe")
 	}
+	if err := g.captureOutput(outPipe, errPipe, cmd.ID); err != nil {
+		return errors.Wrap(err, "capturing output of child process")
+	}
 	if err := grp.Start(cmd); err != nil {
 		return errors.Wrap(err, "starting child process")
 	}
 	if err := insertCmd(tx, groupName, cmd); err != nil {
 		return errors.Wrap(err, "inserting new command")
-	}
-	if err := g.captureOutput(outPipe, errPipe, cmd.Process.Pid); err != nil {
-		return errors.Wrap(err, "capturing output of child process")
 	}
 	query, args := insertActions(
 		action{
@@ -388,6 +374,11 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) err
 	)
 	_, err = tx.Exec(query, args...)
 	return errors.Wrap(err, "inserting cmd start action")
+}
+
+// Wait waits for a process group to finish.
+func (g *Groups) Wait(groupName string) error {
+	return g.getGroup(groupName).Wait(10 * time.Second)
 }
 
 const insertCmdQuery = `INSERT INTO commands (command_id, group_name) VALUES (?, ?)`
@@ -447,6 +438,26 @@ func insertCmdEnv(tx *sql.Tx, cid string, env []string) error {
 	}
 	_, err := tx.Exec(insertCmdEnvQuery, envArgs...)
 	return errors.Wrap(err, "inserting command env")
+}
+
+// filesync copies data from an io.Reader to a file.
+func filesync(dst *os.File, src io.Reader) error {
+	buf := make([]byte, os.Getpagesize())
+	for {
+		if _, err := src.Read(buf); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if _, err := dst.Write(buf); err != nil {
+			return err
+		}
+		if err := dst.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // command is a utility type used to encode/decode commands.
