@@ -18,6 +18,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3" // Load sqlite driver.
 	"github.com/pkg/errors"
+	scgolangsql "github.com/scgolang/exec/sql"
 )
 
 // DirPerms are permissions for directories created by this package.
@@ -257,7 +258,7 @@ func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*exec.Cmd, 
 }
 
 func (g *Groups) initialize() error {
-	sqldata, err := Asset("sql/createTables.sql")
+	sqldata, err := scgolangsql.Asset("sql/createTables.sql")
 	if err != nil {
 		return errors.Wrap(err, "getting sql data")
 	}

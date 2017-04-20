@@ -10,7 +10,7 @@ cover.out:
 coverage: cover.out
 	@go tool cover -html=cover.out
 
-bindata.go: $(SQLFILES)
-	@go-bindata -pkg $(PKG) sql
+sql/bindata.go: $(SQLFILES)
+	@cd sql && go-bindata -pkg sql .
 
 .PHONY: coverage test
