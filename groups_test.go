@@ -5,16 +5,11 @@ import (
 	osexec "os/exec"
 	"testing"
 
-	uuid "github.com/satori/go.uuid"
 	"github.com/scgolang/exec"
 )
 
 const (
 	testGroupName = "echofoo"
-)
-
-var (
-	echofooCommandID = uuid.NewV4().String()
 )
 
 func TestGroups(t *testing.T) {
@@ -23,18 +18,19 @@ func TestGroups(t *testing.T) {
 	_ = os.RemoveAll(root)
 
 	var (
-		commands = []*exec.Cmd{
-			&exec.Cmd{
-				Cmd: osexec.Command("echo", "foo"),
-				ID:  echofooCommandID,
-			},
+		commands = []*osexec.Cmd{
+			osexec.Command("echo", "foo"),
 		}
 		gs = newTestGroups(t, root)
 	)
 	if err := gs.Create(testGroupName, commands...); err != nil {
 		t.Fatal(err)
 	}
-	verifyEchoFoo(gs, echofooCommandID, t)
+	commandID, err := exec.GetCmdID(commands[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyEchoFoo(gs, commandID, t)
 }
 
 func TestGroupsOpen(t *testing.T) {
@@ -46,7 +42,11 @@ func TestGroupsOpen(t *testing.T) {
 	if expected, got := 1, len(cmds); expected != got {
 		t.Fatalf("expected %d, got %d", expected, got)
 	}
-	verifyEchoFoo(gs, cmds[0].ID, t)
+	commandID, err := exec.GetCmdID(cmds[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyEchoFoo(gs, commandID, t)
 }
 
 func newTestGroups(t *testing.T, root string) *exec.Groups {

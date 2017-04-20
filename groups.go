@@ -2,7 +2,10 @@ package exec
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -20,16 +23,9 @@ import (
 // DirPerms are permissions for directories created by this package.
 const DirPerms = 0755
 
-// Cmd is a command with an ID.
-// The ID should be unique per process group.
-type Cmd struct {
-	*exec.Cmd
-	ID string
-}
-
 // CmdError is an error with a particular process.
 type CmdError struct {
-	Cmd *Cmd
+	Cmd *exec.Cmd
 	error
 }
 
@@ -115,22 +111,6 @@ func (g *Groups) Close(groupName string) error {
 
 // closeTx closes a group ands updates the database using the provided Tx.
 func (g *Groups) closeTx(tx *sql.Tx, groupName string, grp *Group) error {
-	var (
-		cmds    = grp.Commands()
-		actions = make([]action, len(cmds))
-	)
-	for i, cmd := range cmds {
-		actions[i] = action{
-			key:       actionCmdStop,
-			commandID: cmd.ID,
-			groupName: groupName,
-			processID: cmd.Process.Pid,
-		}
-	}
-	query, args := insertActions(actions...)
-	if _, err := tx.Exec(query, args...); err != nil {
-		return errors.Wrap(err, "inserting actions")
-	}
 	if err := grp.Signal(syscall.SIGKILL); err != nil {
 		if !strings.HasSuffix(err.Error(), "process already finished") {
 			return errors.Wrap(err, "signalling process group")
@@ -141,7 +121,7 @@ func (g *Groups) closeTx(tx *sql.Tx, groupName string, grp *Group) error {
 }
 
 // Create creates a new group with the provided name.
-func (g *Groups) Create(groupName string, cmds ...*Cmd) error {
+func (g *Groups) Create(groupName string, cmds ...*exec.Cmd) error {
 	tx, err := g.db.Begin()
 	if err != nil {
 		return errors.Wrap(err, "starting transaction")
@@ -153,17 +133,7 @@ func (g *Groups) Create(groupName string, cmds ...*Cmd) error {
 	return errors.Wrap(tx.Commit(), "committing transaction")
 }
 
-func (g *Groups) createTx(tx *sql.Tx, groupName string, cmds ...*Cmd) error {
-	query, args := insertActions(
-		action{
-			key:       actionGroupCreate,
-			commandID: "",
-			groupName: groupName,
-		},
-	)
-	if _, err := tx.Exec(query, args...); err != nil {
-		return err
-	}
+func (g *Groups) createTx(tx *sql.Tx, groupName string, cmds ...*exec.Cmd) error {
 	grp := NewGroup()
 	for _, cmd := range cmds {
 		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
@@ -243,14 +213,14 @@ ON		cmd.command_id = env.command_id
 WHERE		cmd.group_name = ?`
 
 // getGroupCommandsTx gets the command ID's for a group.
-func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*Cmd, error) {
+func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*exec.Cmd, error) {
 	rows, err := tx.Query(getGroupCommands, groupName)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }() // Best effort.
 
-	commandsMap := map[string]*Cmd{}
+	commandsMap := map[string]*exec.Cmd{}
 
 	for rows.Next() {
 		var (
@@ -262,7 +232,7 @@ func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*Cmd, error
 			return nil, err
 		}
 		if _, ok := commandsMap[commandID]; !ok {
-			commandsMap[commandID] = &Cmd{Cmd: &exec.Cmd{}, ID: commandID}
+			commandsMap[commandID] = &exec.Cmd{}
 		}
 		if arg.Valid {
 			commandsMap[commandID].Args = append(commandsMap[commandID].Args, arg.String)
@@ -276,14 +246,11 @@ func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*Cmd, error
 		return nil, errors.Wrap(err, "scanning group commands row")
 	}
 	var (
-		commands = make([]*Cmd, len(commandsMap))
+		commands = make([]*exec.Cmd, len(commandsMap))
 		i        = 0
 	)
-	for id, cmd := range commandsMap {
-		commands[i] = &Cmd{
-			Cmd: exec.Command(cmd.Args[0], cmd.Args[1:]...),
-			ID:  id,
-		}
+	for _, cmd := range commandsMap {
+		commands[i] = exec.Command(cmd.Args[0], cmd.Args[1:]...)
 		i++
 	}
 	return commands, nil
@@ -320,7 +287,7 @@ func (g *Groups) Logs(commandID string, fd int) (*bufio.Scanner, error) {
 
 // Open opens the Group with the provided name and sets it to the current Group.
 // If there is no Group with the provided name then this method initializes a new one.
-func (g *Groups) Open(groupName string) ([]*Cmd, error) {
+func (g *Groups) Open(groupName string) ([]*exec.Cmd, error) {
 	tx, err := g.db.Begin()
 	if err != nil {
 		return nil, errors.Wrap(err, "starting transaction")
@@ -340,7 +307,8 @@ func (g *Groups) Open(groupName string) ([]*Cmd, error) {
 	return cmds, errors.Wrap(tx.Commit(), "committing transaction")
 }
 
-func (g *Groups) openTx(tx *sql.Tx, groupName string, grp *Group, cmds ...*Cmd) error {
+// openTx starts up a process group and stores
+func (g *Groups) openTx(tx *sql.Tx, groupName string, grp *Group, cmds ...*exec.Cmd) error {
 	for _, cmd := range cmds {
 		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
 			return err
@@ -349,7 +317,7 @@ func (g *Groups) openTx(tx *sql.Tx, groupName string, grp *Group, cmds ...*Cmd) 
 	return nil
 }
 
-func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) error {
+func (g *Groups) startTx(tx *sql.Tx, cmd *exec.Cmd, groupName string, grp *Group) error {
 	outPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return errors.Wrap(err, "getting stdout pipe")
@@ -358,21 +326,16 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *Cmd, groupName string, grp *Group) err
 	if err != nil {
 		return errors.Wrap(err, "getting stderr pipe")
 	}
-	if err := g.captureOutput(outPipe, errPipe, cmd.ID); err != nil {
+	commandID, err := GetCmdID(cmd)
+	if err != nil {
+		return errors.Wrap(err, "getting command ID")
+	}
+	if err := g.captureOutput(outPipe, errPipe, commandID); err != nil {
 		return errors.Wrap(err, "capturing output of child process")
 	}
 	if err := grp.Start(cmd); err != nil {
 		return errors.Wrap(err, "starting child process")
 	}
-	query, args := insertActions(
-		action{
-			key:       actionCmdStart,
-			commandID: cmd.ID,
-			groupName: groupName,
-			processID: cmd.Process.Pid,
-		},
-	)
-	_, err = tx.Exec(query, args...)
 	return errors.Wrap(err, "inserting cmd start action")
 }
 
@@ -385,24 +348,28 @@ const insertCmdQuery = `INSERT INTO commands (command_id, group_name) VALUES (?,
 
 // insertCmd inserts a command in the database along with its args and environment variables.
 // Calling code is expected to roll back the transaction if this func returns an error.
-func insertCmd(tx *sql.Tx, groupName string, cmd *Cmd) error {
-	if _, err := tx.Exec(insertCmdQuery, cmd.ID, groupName); err != nil {
+func insertCmd(tx *sql.Tx, groupName string, cmd *exec.Cmd) error {
+	commandID, err := GetCmdID(cmd)
+	if err != nil {
+		return errors.Wrap(err, "getting command ID")
+	}
+	if _, err := tx.Exec(insertCmdQuery, commandID, groupName); err != nil {
 		return errors.Wrap(err, "inserting command")
 	}
 	if len(cmd.Args) > 0 {
-		if err := insertCmdArgs(tx, cmd.ID, cmd.Args); err != nil {
+		if err := insertCmdArgs(tx, commandID, cmd.Args); err != nil {
 			return err
 		}
 	}
 	if len(cmd.Env) > 0 {
-		if err := insertCmdEnv(tx, cmd.ID, cmd.Env); err != nil {
+		if err := insertCmdEnv(tx, commandID, cmd.Env); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func insertCmdArgs(tx *sql.Tx, cid string, args []string) error {
+func insertCmdArgs(tx *sql.Tx, commandID string, args []string) error {
 	var (
 		insertCmdArgsQuery = `INSERT INTO command_args (command_id, idx, arg) VALUES`
 		argsArgs           = make([]interface{}, 3*len(args))
@@ -413,7 +380,7 @@ func insertCmdArgs(tx *sql.Tx, cid string, args []string) error {
 		} else {
 			insertCmdArgsQuery += `, (?, ?, ?)`
 		}
-		argsArgs[(i*3)+0] = cid
+		argsArgs[(i*3)+0] = commandID
 		argsArgs[(i*3)+1] = i
 		argsArgs[(i*3)+2] = arg
 	}
@@ -421,7 +388,7 @@ func insertCmdArgs(tx *sql.Tx, cid string, args []string) error {
 	return errors.Wrap(err, "inserting command arguments")
 }
 
-func insertCmdEnv(tx *sql.Tx, cid string, env []string) error {
+func insertCmdEnv(tx *sql.Tx, commandID string, env []string) error {
 	var (
 		insertCmdEnvQuery = `INSERT INTO command_env  (command_id, idx, env) VALUES`
 		envArgs           = make([]interface{}, 3*len(env))
@@ -432,7 +399,7 @@ func insertCmdEnv(tx *sql.Tx, cid string, env []string) error {
 		} else {
 			insertCmdEnvQuery += `, (?, ?, ?)`
 		}
-		envArgs[(i*3)+0] = cid
+		envArgs[(i*3)+0] = commandID
 		envArgs[(i*3)+1] = i
 		envArgs[(i*3)+2] = env
 	}
@@ -460,44 +427,24 @@ func filesync(dst *os.File, src io.Reader) error {
 	return nil
 }
 
-// command is a utility type used to encode/decode commands.
-type command struct {
-	Args []string `json:"args"`
-	Env  []string `json:"env"`
-	Path string   `json:"path"`
-}
-
-// action is a utility type used to insert actions against process groups
-// into the groups log.
-type action struct {
-	key       string
-	commandID string
-	groupName string
-	processID int
-}
-
-// Actions
-const (
-	actionCmdStart    = "command_start"
-	actionCmdStop     = "command_stop"
-	actionGroupCreate = "group_create"
-	actionGroupRemove = "group_remove"
-)
-
-func insertActions(actions ...action) (query string, args []interface{}) {
-	query = `INSERT INTO groups_log (action_name, command_id, group_name, process_id) VALUES`
-	args = make([]interface{}, 4*len(actions))
-
-	for i, action := range actions {
-		if i == 0 {
-			query += ` (?, ?, ?, ?)`
-		} else {
-			query += `, (?, ?, ?, ?)`
-		}
-		args[(i*3)+0] = action.key
-		args[(i*3)+1] = action.commandID
-		args[(i*3)+2] = action.groupName
-		args[(i*3)+3] = action.processID
+// GetCmdID hashes the args and env of a command to form a unique ID.
+func GetCmdID(cmd *exec.Cmd) (string, error) {
+	var (
+		h    = sha256.New()
+		args = bytes.Join(s2b(cmd.Args), []byte{' '})
+		env  = bytes.Join(s2b(cmd.Env), []byte{' '})
+	)
+	_, err := h.Write(bytes.Join([][]byte{args, env}, []byte{' '}))
+	if err != nil {
+		return "", err
 	}
-	return query, args
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func s2b(ss []string) [][]byte {
+	bs := make([][]byte, len(ss))
+	for i, s := range ss {
+		bs[i] = []byte(s)
+	}
+	return bs
 }

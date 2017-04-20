@@ -6,3 +6,7 @@ cover*
 
 # local data directory
 .data/
+
+# stdout and stderr capture files
+*.stdout
+*.stderr
