@@ -12,7 +12,7 @@ const (
 	testGroupName = "echofoo"
 )
 
-func TestGroups(t *testing.T) {
+func TestGroupsCreate(t *testing.T) {
 	const root = ".data"
 
 	_ = os.RemoveAll(root)
@@ -71,4 +71,51 @@ func verifyEchoFoo(gs *exec.Groups, commandID string, t *testing.T) {
 	if expected, got := "foo", scanner.Text(); expected != got {
 		t.Fatalf("expected %s, got %s", expected, got)
 	}
+}
+
+func TestGroupsRemove(t *testing.T) {
+	const (
+		groupName = "greps"
+		root      = ".data"
+	)
+
+	_ = os.RemoveAll(root)
+
+	var (
+		commands = []*osexec.Cmd{
+			osexec.Command("grep", "foo"),
+			osexec.Command("grep", "bar"),
+			osexec.Command("grep", "baz"),
+		}
+		gs = newTestGroups(t, root)
+	)
+	if err := gs.Create(groupName, commands...); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.Remove(groupName, getCommandID(commands[1], t)); err != nil {
+		t.Fatal(err)
+	}
+	cmds, ok := gs.Commands(groupName)
+	if !ok {
+		t.Fatal("group does not exist")
+	}
+	if expected, got := 2, len(cmds); expected != got {
+		t.Fatalf("expected %d commands, got %d", expected, got)
+	}
+	for i, cmd := range []*osexec.Cmd{
+		osexec.Command("grep", "foo"),
+		osexec.Command("grep", "baz"),
+	} {
+		if expected, got := getCommandID(cmd, t), getCommandID(cmds[i], t); expected != got {
+			t.Fatalf("expected command ID %s, got %s", expected, got)
+		}
+	}
+}
+
+func getCommandID(cmd *osexec.Cmd, t *testing.T) string {
+	cid, err := exec.GetCmdID(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cid
 }

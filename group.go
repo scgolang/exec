@@ -3,13 +3,12 @@ package exec
 import (
 	"os"
 	"os/exec"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
 )
-
-// Pid is a process ID.
-type Pid int
 
 // Group runs a set of commands.
 type Group struct {
@@ -31,6 +30,33 @@ func NewGroup() *Group {
 // Commands returns the commands associated with the Group.
 func (g *Group) Commands() []*exec.Cmd {
 	return g.cmds
+}
+
+// Remove removes commands from a group.
+// Any commands with the provided ID's are stopped and removed from the group.
+func (g *Group) Remove(commandIDs ...string) error {
+	var (
+		cmds = []*exec.Cmd{}
+		cm   = map[string]struct{}{}
+	)
+	for _, cid := range commandIDs {
+		cm[cid] = struct{}{}
+	}
+	for _, cmd := range g.cmds {
+		cid, err := GetCmdID(cmd)
+		if err != nil {
+			return errors.Wrap(err, "getting command ID")
+		}
+		if _, ok := cm[cid]; ok {
+			if err := g.Stop(cmd.Process.Pid); err != nil {
+				return errors.Wrapf(err, "stopping process PID=%d", cmd.Process.Pid)
+			}
+			continue
+		}
+		cmds = append(cmds, cmd)
+	}
+	g.cmds = cmds
+	return nil
 }
 
 // Signal sends a signal to every process in the Group.
@@ -64,6 +90,35 @@ func (g *Group) Start(cmd *exec.Cmd) error {
 	return nil
 }
 
+// Stop stops a process.
+func (g *Group) Stop(pid int) error {
+	var (
+		cmd  *exec.Cmd
+		cmds = []*exec.Cmd{}
+	)
+	for _, cc := range g.cmds {
+		if cc.Process.Pid == pid {
+			cmd = cc
+			continue
+		}
+		cmds = append(cmds, cc)
+	}
+	if cmd == nil {
+		return errors.Errorf("process %d not found", pid)
+	}
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		if isAlreadyFinished(err) {
+			return nil // The process is already finished.
+		}
+		return errors.Wrap(err, "sending kill signal")
+	}
+	if err := cmd.Wait(); err != nil {
+		return errors.Wrap(err, "waiting for process to finish")
+	}
+	g.cmds = cmds
+	return nil
+}
+
 // Wait waits for all commands to finish.
 // If there was an error running any of the commands then CmdError will be returned.
 func (g *Group) Wait(timeout time.Duration) error {
@@ -78,4 +133,8 @@ func (g *Group) Wait(timeout time.Duration) error {
 		}
 	}
 	return nil
+}
+
+func isAlreadyFinished(err error) bool {
+	return strings.HasSuffix(err.Error(), "process already finished")
 }

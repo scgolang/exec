@@ -16,3 +16,8 @@ CREATE TABLE IF NOT EXISTS command_env (
 	idx			INTEGER,
 	env_var			TEXT
 );
+
+CREATE TABLE IF NOT EXISTS processes (
+	command_id		TEXT,
+	process_id		INTEGER
+);

@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -113,12 +112,25 @@ func (g *Groups) Close(groupName string) error {
 // closeTx closes a group ands updates the database using the provided Tx.
 func (g *Groups) closeTx(tx *sql.Tx, groupName string, grp *Group) error {
 	if err := grp.Signal(syscall.SIGKILL); err != nil {
-		if !strings.HasSuffix(err.Error(), "process already finished") {
+		if !isAlreadyFinished(err) {
 			return errors.Wrap(err, "signalling process group")
 		}
 	}
 	// Arbitrary timeout.
 	return errors.Wrap(grp.Wait(2*time.Second), "waiting for process group")
+}
+
+// Commands returns the commands that are part of the specified group.
+// If a group with the provided name does not exist it returns nil and false,
+// otherwise it returns a slice and true.
+func (g *Groups) Commands(groupName string) ([]*exec.Cmd, bool) {
+	g.groupsMu.RLock()
+	grp, ok := g.groups[groupName]
+	g.groupsMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return grp.Commands(), true
 }
 
 // Create creates a new group with the provided name.
@@ -316,6 +328,37 @@ func (g *Groups) openTx(tx *sql.Tx, groupName string, grp *Group, cmds ...*exec.
 		}
 	}
 	return nil
+}
+
+// Remove removes commands from a group.
+func (g *Groups) Remove(groupName string, commandIDs ...string) error {
+	if len(commandIDs) == 0 {
+		return nil
+	}
+	grp := g.getGroup(groupName)
+
+	if grp == nil {
+		return errors.Errorf("group %s not found", groupName)
+	}
+	if err := grp.Remove(commandIDs...); err != nil {
+		return errors.Wrap(err, "removing commands from group")
+	}
+	var (
+		args  = make([]interface{}, 1+len(commandIDs))
+		query = `DELETE FROM commands WHERE group_name = ? AND (`
+	)
+	args[0] = groupName
+
+	for i, commandID := range commandIDs {
+		if i > 0 {
+			query += ` OR `
+		}
+		query += `command_id = ?`
+		args[i+1] = commandID
+	}
+	query += `)`
+	_, err := g.db.Exec(query, args...)
+	return err
 }
 
 func (g *Groups) startTx(tx *sql.Tx, cmd *exec.Cmd, groupName string, grp *Group) error {
