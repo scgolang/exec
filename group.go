@@ -36,19 +36,25 @@ func (g *Group) Commands() []*exec.Cmd {
 // If no PID's are passed this method stops all the processes in the group.
 func (g *Group) Remove(cmds ...*exec.Cmd) error {
 	var (
-		newCmds = []*exec.Cmd{}
-		pm      = map[int]struct{}{}
-		errs    = []string{}
-		errch   = make(chan error)
-		done    = make(chan struct{})
+		pm       = map[int]struct{}{}
+		errs     = []string{}
+		errch    = make(chan error)
+		done     = make(chan struct{})
+		stopping []*exec.Cmd
 	)
-	for _, cmd := range cmds {
+	if len(cmds) == 0 {
+		stopping = g.cmds
+	} else {
+		stopping = cmds
+	}
+	for _, cmd := range stopping {
 		pm[cmd.Process.Pid] = struct{}{}
 
 		go func(cmd *exec.Cmd) {
 			if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
 				if isAlreadyFinished(err) {
 					done <- struct{}{} // The process is already finished.
+					return
 				}
 				errch <- errors.Wrap(err, "sending kill signal")
 			}
@@ -69,8 +75,10 @@ func (g *Group) Remove(cmds ...*exec.Cmd) error {
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, ", and "))
 	}
+	newCmds := []*exec.Cmd{}
+
 	for _, cc := range g.cmds {
-		if _, ok := pm[cc.Process.Pid]; ok || len(pm) == 0 {
+		if _, ok := pm[cc.Process.Pid]; ok {
 			continue
 		}
 		newCmds = append(newCmds, cc)

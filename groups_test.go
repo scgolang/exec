@@ -114,6 +114,37 @@ func TestGroupsRemove(t *testing.T) {
 	}
 }
 
+func TestGroupsRemoveAll(t *testing.T) {
+	const (
+		groupName = "greps"
+		root      = ".data"
+	)
+
+	_ = os.RemoveAll(root)
+
+	var (
+		commands = []*osexec.Cmd{
+			osexec.Command("grep", "foo"),
+			osexec.Command("grep", "bar"),
+			osexec.Command("grep", "baz"),
+		}
+		gs = newTestGroups(t, root)
+	)
+	if err := gs.Create(groupName, commands...); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.Remove(groupName); err != nil {
+		t.Fatal(err)
+	}
+	cmds, ok := gs.Commands(groupName)
+	if !ok {
+		t.Fatal("group does not exist")
+	}
+	if expected, got := 0, len(cmds); expected != got {
+		t.Fatalf("expected %d commands, got %d", expected, got)
+	}
+}
+
 func getCommandID(cmd *osexec.Cmd, t *testing.T) string {
 	cid, err := exec.GetCmdID(cmd)
 	if err != nil {
