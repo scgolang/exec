@@ -61,10 +61,12 @@ func verifyEchoFoo(gs *exec.Groups, commandID string, t *testing.T) {
 	if err := gs.Wait(testGroupName); err != nil {
 		t.Fatal(err)
 	}
-	scanner, err := gs.Logs(commandID, 1)
+	scanner, closer, err := gs.Logs(commandID, testGroupName, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = closer.Close() }()
+
 	if !scanner.Scan() {
 		t.Fatal("expected to be able to scan one line")
 	}

@@ -75,12 +75,12 @@ func NewGroups(root, dbfile string) (*Groups, error) {
 }
 
 // captureOutput captures the output of the provided command.
-func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, commandID string) error {
-	stdout, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%s.stdout", commandID)))
+func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, groupName, commandID string) error {
+	stdout, err := os.Create(filepath.Join(g.root, groupName, fmt.Sprintf("%s.stdout", commandID)))
 	if err != nil {
 		return errors.Wrap(err, "creating new process stdout file")
 	}
-	stderr, err := os.Create(filepath.Join(g.root, fmt.Sprintf("%s.stderr", commandID)))
+	stderr, err := os.Create(filepath.Join(g.root, groupName, fmt.Sprintf("%s.stderr", commandID)))
 	if err != nil {
 		return errors.Wrap(err, "creating new process stderr file")
 	}
@@ -281,21 +281,22 @@ func (g *Groups) initialize() error {
 // Logs returns a *bufio.Scanner that can be used to
 // read the logs of a process in the current group.
 // Pass 1 to get stdout and 2 to get stderr.
-func (g *Groups) Logs(commandID string, fd int) (*bufio.Scanner, error) {
+// Calling code is expected to close the io.Closer that is returned.
+func (g *Groups) Logs(commandID, groupName string, fd int) (*bufio.Scanner, io.Closer, error) {
 	var filename string
 	switch fd {
 	default:
-		return nil, errors.Errorf("fd (%d) must be either 1 (stdout) or 2 (stderr)", fd)
+		return nil, nil, errors.Errorf("fd (%d) must be either 1 (stdout) or 2 (stderr)", fd)
 	case 1:
 		filename = fmt.Sprintf("%s.stdout", commandID)
 	case 2:
 		filename = fmt.Sprintf("%s.stderr", commandID)
 	}
-	f, err := os.Open(filepath.Join(g.root, filename))
+	f, err := os.Open(filepath.Join(g.root, groupName, filename))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return bufio.NewScanner(f), nil
+	return bufio.NewScanner(f), f, nil
 }
 
 // Open opens the Group with the provided name and sets it to the current Group.
@@ -374,7 +375,12 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *exec.Cmd, groupName string, grp *Group
 	if err != nil {
 		return errors.Wrap(err, "getting command ID")
 	}
-	if err := g.captureOutput(outPipe, errPipe, commandID); err != nil {
+	if err := os.Mkdir(filepath.Join(g.root, groupName), DirPerms); err != nil {
+		if !os.IsExist(err) {
+			return errors.Wrap(err, "creating group directory")
+		}
+	}
+	if err := g.captureOutput(outPipe, errPipe, groupName, commandID); err != nil {
 		return errors.Wrap(err, "capturing output of child process")
 	}
 	if err := grp.Start(cmd); err != nil {
