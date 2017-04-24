@@ -1,6 +1,8 @@
 CREATE TABLE IF NOT EXISTS commands (
-	command_id		TEXT		PRIMARY KEY,
-	group_name		TEXT
+	command_id		TEXT,
+	group_name		TEXT,
+
+	UNIQUE (command_id, group_name)
 );
 
 CREATE INDEX IF NOT EXISTS group_name_idx ON commands (command_id, group_name);

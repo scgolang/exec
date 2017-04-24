@@ -94,7 +94,7 @@ func TestGroupsRemove(t *testing.T) {
 	if err := gs.Create(groupName, commands...); err != nil {
 		t.Fatal(err)
 	}
-	if err := gs.Remove(groupName, getCommandID(commands[1], t)); err != nil {
+	if err := gs.Remove(groupName, commands[1]); err != nil {
 		t.Fatal(err)
 	}
 	cmds, ok := gs.Commands(groupName)

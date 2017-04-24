@@ -269,6 +269,35 @@ func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*exec.Cmd, 
 	return commands, nil
 }
 
+// const getGroupProcessesQuery = `
+// SELECT    process_id
+// FROM      processes p
+// LEFT JOIN commands c
+//        ON p.command_id = c.command_id
+// WHERE     c.group_name = ?`
+
+// func (g *Groups) getGroupProcesses(groupName string) ([]int, error) {
+// 	rows, err := g.db.Query(getGroupProcessesQuery, groupName)
+// 	if err != nil {
+// 		return nil, errors.Wrap(err, "querying database")
+// 	}
+// 	defer func() { _ = rows.Close() }()
+
+// 	var (
+// 		i    = 0
+// 		pids = []int{}
+// 	)
+// 	for rows.Next() {
+// 		var pid int
+// 		if err := rows.Scan(&pid); err != nil {
+// 			return nil, errors.Wrapf(err, "scanning row %d", i)
+// 		}
+// 		pids = append(pids, pid)
+// 		i++
+// 	}
+// 	return pids, rows.Err()
+// }
+
 func (g *Groups) initialize() error {
 	sqldata, err := scgolangsql.Asset("sql/createTables.sql")
 	if err != nil {
@@ -331,31 +360,33 @@ func (g *Groups) openTx(tx *sql.Tx, groupName string, grp *Group, cmds ...*exec.
 	return nil
 }
 
-// Remove removes commands from a group.
-func (g *Groups) Remove(groupName string, commandIDs ...string) error {
-	if len(commandIDs) == 0 {
-		return nil
-	}
+// Remove removes commands from a group, or removes a group entirely
+// if there are no command ID's passed.
+func (g *Groups) Remove(groupName string, cmds ...*exec.Cmd) error {
 	grp := g.getGroup(groupName)
 
 	if grp == nil {
 		return errors.Errorf("group %s not found", groupName)
 	}
-	if err := grp.Remove(commandIDs...); err != nil {
+	if err := grp.Remove(cmds...); err != nil {
 		return errors.Wrap(err, "removing commands from group")
 	}
 	var (
-		args  = make([]interface{}, 1+len(commandIDs))
+		args  = make([]interface{}, 1+len(cmds))
 		query = `DELETE FROM commands WHERE group_name = ? AND (`
 	)
 	args[0] = groupName
 
-	for i, commandID := range commandIDs {
+	for i, cmd := range cmds {
+		cmdID, err := GetCmdID(cmd)
+		if err != nil {
+			return errors.Wrap(err, "getting command ID")
+		}
 		if i > 0 {
 			query += ` OR `
 		}
 		query += `command_id = ?`
-		args[i+1] = commandID
+		args[i+1] = cmdID
 	}
 	query += `)`
 	_, err := g.db.Exec(query, args...)
@@ -408,12 +439,12 @@ func insertCmd(tx *sql.Tx, groupName string, cmd *exec.Cmd) error {
 	}
 	if len(cmd.Args) > 0 {
 		if err := insertCmdArgs(tx, commandID, cmd.Args); err != nil {
-			return err
+			return errors.Wrap(err, "inserting command args")
 		}
 	}
 	if len(cmd.Env) > 0 {
 		if err := insertCmdEnv(tx, commandID, cmd.Env); err != nil {
-			return err
+			return errors.Wrap(err, "inserting command environment")
 		}
 	}
 	return nil

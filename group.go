@@ -32,30 +32,50 @@ func (g *Group) Commands() []*exec.Cmd {
 	return g.cmds
 }
 
-// Remove removes commands from a group.
-// Any commands with the provided ID's are stopped and removed from the group.
-func (g *Group) Remove(commandIDs ...string) error {
+// Remove removes processes from a Group.
+// If no PID's are passed this method stops all the processes in the group.
+func (g *Group) Remove(cmds ...*exec.Cmd) error {
 	var (
-		cmds = []*exec.Cmd{}
-		cm   = map[string]struct{}{}
+		newCmds = []*exec.Cmd{}
+		pm      = map[int]struct{}{}
+		errs    = []string{}
+		errch   = make(chan error)
+		done    = make(chan struct{})
 	)
-	for _, cid := range commandIDs {
-		cm[cid] = struct{}{}
-	}
-	for _, cmd := range g.cmds {
-		cid, err := GetCmdID(cmd)
-		if err != nil {
-			return errors.Wrap(err, "getting command ID")
-		}
-		if _, ok := cm[cid]; ok {
-			if err := g.Stop(cmd.Process.Pid); err != nil {
-				return errors.Wrapf(err, "stopping process PID=%d", cmd.Process.Pid)
+	for _, cmd := range cmds {
+		pm[cmd.Process.Pid] = struct{}{}
+
+		go func(cmd *exec.Cmd) {
+			if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+				if isAlreadyFinished(err) {
+					done <- struct{}{} // The process is already finished.
+				}
+				errch <- errors.Wrap(err, "sending kill signal")
 			}
+			if err := cmd.Wait(); err != nil {
+				errch <- errors.Wrap(err, "waiting for process to finish")
+			}
+		}(cmd)
+	}
+	for range pm {
+		select {
+		case <-time.After(2 * time.Second):
+			return errors.New("timeout")
+		case <-done:
+		case err := <-errch:
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, ", and "))
+	}
+	for _, cc := range g.cmds {
+		if _, ok := pm[cc.Process.Pid]; ok || len(pm) == 0 {
 			continue
 		}
-		cmds = append(cmds, cmd)
+		newCmds = append(newCmds, cc)
 	}
-	g.cmds = cmds
+	g.cmds = newCmds
 	return nil
 }
 
@@ -87,35 +107,6 @@ func (g *Group) Start(cmd *exec.Cmd) error {
 		g.done <- cmd
 	}()
 	g.cmds = append(g.cmds, cmd)
-	return nil
-}
-
-// Stop stops a process.
-func (g *Group) Stop(pid int) error {
-	var (
-		cmd  *exec.Cmd
-		cmds = []*exec.Cmd{}
-	)
-	for _, cc := range g.cmds {
-		if cc.Process.Pid == pid {
-			cmd = cc
-			continue
-		}
-		cmds = append(cmds, cc)
-	}
-	if cmd == nil {
-		return errors.Errorf("process %d not found", pid)
-	}
-	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
-		if isAlreadyFinished(err) {
-			return nil // The process is already finished.
-		}
-		return errors.Wrap(err, "sending kill signal")
-	}
-	if err := cmd.Wait(); err != nil {
-		return errors.Wrap(err, "waiting for process to finish")
-	}
-	g.cmds = cmds
 	return nil
 }
 
