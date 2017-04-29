@@ -75,7 +75,11 @@ func NewGroups(root, dbfile string) (*Groups, error) {
 }
 
 // captureOutput captures the output of the provided command.
-func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, groupName, commandID string) error {
+func (g *Groups) captureOutput(outPipe, errPipe io.ReadCloser, groupName string, cmd *exec.Cmd) error {
+	commandID, err := GetCmdID(cmd)
+	if err != nil {
+		return errors.Wrap(err, "getting command ID")
+	}
 	stdout, err := os.Create(filepath.Join(g.root, groupName, fmt.Sprintf("%s.stdout", commandID)))
 	if err != nil {
 		return errors.Wrap(err, "creating new process stdout file")
@@ -146,6 +150,7 @@ func (g *Groups) Create(groupName string, cmds ...*exec.Cmd) error {
 	return errors.Wrap(tx.Commit(), "committing transaction")
 }
 
+// createTx creates a group with a sql transaction.
 func (g *Groups) createTx(tx *sql.Tx, groupName string, cmds ...*exec.Cmd) error {
 	grp := NewGroup()
 	for _, cmd := range cmds {
@@ -216,18 +221,19 @@ func (g *Groups) getGroup(name string) *Group {
 	return grp
 }
 
-const getGroupCommands = `
-SELECT		cmd.command_id, arg, env_var
-FROM		commands cmd
-LEFT JOIN	command_args args
-ON		cmd.command_id = args.command_id
-LEFT JOIN	command_env env
-ON		cmd.command_id = env.command_id
-WHERE		cmd.group_name = ?`
+const getGroupProcesses = `
+SELECT		p.command_id, arg, env_var
+FROM		processes p
+LEFT JOIN	command_args a
+ON		p.command_id = a.command_id
+LEFT JOIN	command_env e
+ON		p.command_id = e.command_id
+WHERE		p.group_name = ?`
 
-// getGroupCommandsTx gets the command ID's for a group.
-func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*exec.Cmd, error) {
-	rows, err := tx.Query(getGroupCommands, groupName)
+// getGroupProcessesTx gets the processes for a group from a database using
+// the provided sql transaction.
+func (g *Groups) getGroupProcessesTx(tx *sql.Tx, groupName string) ([]*exec.Cmd, error) {
+	rows, err := tx.Query(getGroupProcesses, groupName)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +276,7 @@ func (g *Groups) getGroupCommandsTx(tx *sql.Tx, groupName string) ([]*exec.Cmd, 
 }
 
 func (g *Groups) initialize() error {
-	sqldata, err := scgolangsql.Asset("sql/createTables.sql")
+	sqldata, err := scgolangsql.Asset("createTables.sql")
 	if err != nil {
 		return errors.Wrap(err, "getting sql data")
 	}
@@ -282,7 +288,11 @@ func (g *Groups) initialize() error {
 // read the logs of a process in the current group.
 // Pass 1 to get stdout and 2 to get stderr.
 // Calling code is expected to close the io.Closer that is returned.
-func (g *Groups) Logs(commandID, groupName string, fd int) (*bufio.Scanner, io.Closer, error) {
+func (g *Groups) Logs(groupName string, cmd *exec.Cmd, fd int) (*bufio.Scanner, io.Closer, error) {
+	commandID, err := GetCmdID(cmd)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "getting command ID")
+	}
 	var filename string
 	switch fd {
 	default:
@@ -306,7 +316,7 @@ func (g *Groups) Open(groupName string) ([]*exec.Cmd, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "starting transaction")
 	}
-	cmds, err := g.getGroupCommandsTx(tx, groupName)
+	cmds, err := g.getGroupProcessesTx(tx, groupName)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting group commands")
 	}
@@ -321,7 +331,7 @@ func (g *Groups) Open(groupName string) ([]*exec.Cmd, error) {
 	return cmds, errors.Wrap(tx.Commit(), "committing transaction")
 }
 
-// openTx starts up a process group and stores
+// openTx starts up a process group.
 func (g *Groups) openTx(tx *sql.Tx, groupName string, grp *Group, cmds ...*exec.Cmd) error {
 	for _, cmd := range cmds {
 		if err := g.startTx(tx, cmd, groupName, grp); err != nil {
@@ -348,25 +358,21 @@ func (g *Groups) Remove(groupName string, cmds ...*exec.Cmd) error {
 func (g *Groups) removeTx(tx *sql.Tx, groupName string, cmds ...*exec.Cmd) error {
 	var (
 		args  = make([]interface{}, 1+len(cmds))
-		query = `DELETE FROM commands WHERE group_name = ? AND (`
+		query = `DELETE FROM processes WHERE group_name = ? AND (`
 	)
 	args[0] = groupName
 
 	for i, cmd := range cmds {
-		cmdID, err := GetCmdID(cmd)
-		if err != nil {
-			return errors.Wrap(err, "getting command ID")
-		}
 		if i > 0 {
 			query += ` OR `
 		}
-		query += `command_id = ?`
-		args[i+1] = cmdID
+		query += `process_id = ?`
+		args[i+1] = cmd.Process.Pid
 	}
 	query += `)`
 
 	if len(cmds) == 0 {
-		query = `DELETE FROM commands WHERE group_name = ?`
+		query = `DELETE FROM processes WHERE group_name = ?`
 	}
 	if _, err := g.db.Exec(query, args...); err != nil {
 		return errors.Wrap(err, "deleting group commands from database")
@@ -388,16 +394,12 @@ func (g *Groups) startTx(tx *sql.Tx, cmd *exec.Cmd, groupName string, grp *Group
 	if err != nil {
 		return errors.Wrap(err, "getting stderr pipe")
 	}
-	commandID, err := GetCmdID(cmd)
-	if err != nil {
-		return errors.Wrap(err, "getting command ID")
-	}
 	if err := os.Mkdir(filepath.Join(g.root, groupName), DirPerms); err != nil {
 		if !os.IsExist(err) {
 			return errors.Wrap(err, "creating group directory")
 		}
 	}
-	if err := g.captureOutput(outPipe, errPipe, groupName, commandID); err != nil {
+	if err := g.captureOutput(outPipe, errPipe, groupName, cmd); err != nil {
 		return errors.Wrap(err, "capturing output of child process")
 	}
 	if err := grp.Start(cmd); err != nil {
@@ -411,7 +413,8 @@ func (g *Groups) Wait(groupName string) error {
 	return g.getGroup(groupName).Wait(10 * time.Second)
 }
 
-const insertCmdQuery = `INSERT INTO commands (command_id, group_name) VALUES (?, ?)`
+const insertCmdQuery = `INSERT INTO processes (command_id, group_name, process_id)
+                        VALUES                (?,          ?,          ?)`
 
 // insertCmd inserts a command in the database along with its args and environment variables.
 // Calling code is expected to roll back the transaction if this func returns an error.
@@ -420,7 +423,7 @@ func insertCmd(tx *sql.Tx, groupName string, cmd *exec.Cmd) error {
 	if err != nil {
 		return errors.Wrap(err, "getting command ID")
 	}
-	if _, err := tx.Exec(insertCmdQuery, commandID, groupName); err != nil {
+	if _, err := tx.Exec(insertCmdQuery, commandID, groupName, cmd.Process.Pid); err != nil {
 		return errors.Wrap(err, "inserting command")
 	}
 	if len(cmd.Args) > 0 {

@@ -3,50 +3,44 @@ package exec_test
 import (
 	"os"
 	osexec "os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/scgolang/exec"
 )
 
-const (
-	testGroupName = "echofoo"
-)
-
 func TestGroupsCreate(t *testing.T) {
-	const root = ".data"
-
+	var (
+		groupName = "echofoo"
+		root      = filepath.Join("testdata", "."+t.Name())
+	)
 	_ = os.RemoveAll(root)
 
 	var (
-		commands = []*osexec.Cmd{
+		cmds = []*osexec.Cmd{
 			osexec.Command("echo", "foo"),
 		}
 		gs = newTestGroups(t, root)
 	)
-	if err := gs.Create(testGroupName, commands...); err != nil {
+	if err := gs.Create(groupName, cmds...); err != nil {
 		t.Fatal(err)
 	}
-	commandID, err := exec.GetCmdID(commands[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	verifyEchoFoo(gs, commandID, t)
+	verifyEchoFoo(gs, groupName, cmds[0], t)
 }
 
 func TestGroupsOpen(t *testing.T) {
-	gs := newTestGroups(t, ".echofoo")
-	cmds, err := gs.Open(testGroupName)
+	var (
+		groupName = "echofoo"
+		gs        = newTestGroups(t, "."+t.Name())
+	)
+	cmds, err := gs.Open(groupName)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if expected, got := 1, len(cmds); expected != got {
 		t.Fatalf("expected %d, got %d", expected, got)
 	}
-	commandID, err := exec.GetCmdID(cmds[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	verifyEchoFoo(gs, commandID, t)
+	verifyEchoFoo(gs, groupName, cmds[0], t)
 }
 
 func newTestGroups(t *testing.T, root string) *exec.Groups {
@@ -57,11 +51,11 @@ func newTestGroups(t *testing.T, root string) *exec.Groups {
 	return gs
 }
 
-func verifyEchoFoo(gs *exec.Groups, commandID string, t *testing.T) {
-	if err := gs.Wait(testGroupName); err != nil {
+func verifyEchoFoo(gs *exec.Groups, groupName string, cmd *osexec.Cmd, t *testing.T) {
+	if err := gs.Wait(groupName); err != nil {
 		t.Fatal(err)
 	}
-	scanner, closer, err := gs.Logs(commandID, testGroupName, 1)
+	scanner, closer, err := gs.Logs(groupName, cmd, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,9 +70,9 @@ func verifyEchoFoo(gs *exec.Groups, commandID string, t *testing.T) {
 }
 
 func TestGroupsRemove(t *testing.T) {
-	const (
+	var (
 		groupName = "greps"
-		root      = ".data"
+		root      = filepath.Join("testdata", "."+t.Name())
 	)
 
 	_ = os.RemoveAll(root)
