@@ -2,6 +2,7 @@
 cover*
 
 # test data
+testdata/
 
 # local data directory
 .data/
